@@ -114,6 +114,12 @@ int wmain(int argc, wchar_t **argv) {
     auto wide = static_cast<wchar_t *>(HeapAlloc(heap, HEAP_ZERO_MEMORY, 4096));
     wcscpy_s(wide, 2048, L"Heapglass UTF-16LE fixture: allocation generation and snapshot comparison.");
     log("utf16", heap, wide, 4096);
+    auto utf8_text = static_cast<char *>(HeapAlloc(heap, HEAP_ZERO_MEMORY, 4096));
+    strcpy_s(utf8_text, 4096, "Heapglass UTF-8 fixture: שלום 世界 😀");
+    log("utf8-multilingual", heap, utf8_text, 4096);
+    auto unicode_text = static_cast<wchar_t *>(HeapAlloc(heap, HEAP_ZERO_MEMORY, 4096));
+    wcscpy_s(unicode_text, 2048, L"שלום 世界 Ελληνικά Привет 😀");
+    log("utf16-multilingual", heap, unicode_text, 4096);
     auto random = static_cast<PUCHAR>(HeapAlloc(heap, 0, 65536));
     std::mt19937 rng(0x48475031);
     for (size_t i = 0; i < 65536; ++i)

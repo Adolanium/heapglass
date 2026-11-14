@@ -83,6 +83,32 @@ void allocation_semantics() {
     m.apply(event(Op::allocate, 31, 32, 0xc000));
     REQUIRE(m.records.at(8).life == Life::live);
 }
+void uncertain_boundaries() {
+    auto m = model();
+    m.apply(event(Op::allocate, 1, 2, 0x2000));
+    m.loss(1, 4);
+    m.apply(event(Op::free, 5, 6, 1, 0x2000));
+    REQUIRE(m.records.at(1).life == Life::uncertain);
+    REQUIRE(m.records.at(1).died == 0);
+    REQUIRE(m.live.empty());
+    auto n = model();
+    n.apply(event(Op::allocate, 1, 2, 0x2000));
+    n.apply(event(Op::destroy_heap, 3, 4, 0));
+    REQUIRE(n.live.empty());
+    n.apply(event(Op::create_heap, 5, 6, 0x1000));
+    n.apply(event(Op::allocate, 7, 8, 0x2000));
+    REQUIRE(n.records.at(1).life == Life::freed);
+    REQUIRE(n.records.at(1).died == 40);
+    REQUIRE(n.records.at(2).id.heap_generation != n.records.at(1).id.heap_generation);
+    auto boundary = model();
+    boundary.unsafe_through = 10;
+    boundary.apply(event(Op::allocate, 5, 11, 0x2000));
+    REQUIRE(boundary.records.at(1).life == Life::uncertain);
+    REQUIRE(!boundary.records.at(1).birth_known);
+    boundary.apply(event(Op::allocate, 12, 13, 0x3000));
+    REQUIRE(boundary.records.at(2).life == Life::live);
+    REQUIRE(boundary.records.at(2).birth_known);
+}
 void delayed_free_race() {
     auto m = model();
     m.apply(event(Op::allocate, 1, 2, 0x2000));
@@ -103,10 +129,10 @@ void delayed_free_race() {
 }
 Capture cap(std::vector<uint8_t> bytes, uint64_t begin = 10) {
     Capture c;
-    c.bytes = std::move(bytes);
+    c.set_bytes(std::move(bytes));
     c.begin = begin;
     c.end = begin + 1;
-    c.requested = c.bytes.size();
+    c.requested = c.bytes().size();
     c.attributed = true;
     return c;
 }
@@ -224,17 +250,22 @@ void storage() {
     m.capture(1, cap({'H', 'e', 'l', 'l', 'o', 0, 0, 0}));
     m.snapshots.push_back(m.snapshot("one", 10, 11));
     m.limits.high_entropy = 7.6;
+    m.records.at(1).stack = {0x10000, 0x20000};
+    m.records.at(1).stack_count = 2;
+    m.records.at(1).stack_status = 1;
     save_session(m, p.wstring(), true);
     auto loaded = load_session(p.wstring());
     REQUIRE(loaded.offline);
+    REQUIRE(loaded.records.at(1).stack_count == 2);
+    REQUIRE(loaded.records.at(1).stack[1] == 0x20000);
     REQUIRE(loaded.limits.high_entropy == 7.6);
-    REQUIRE(loaded.records.at(1).captures.back().bytes ==
+    REQUIRE(loaded.records.at(1).captures.back().bytes() ==
             std::vector<uint8_t>({'H', 'e', 'l', 'l', 'o', 0, 0, 0}));
     REQUIRE(loaded.snapshots[0].name == "one");
     save_session(m, p.wstring(), false);
     loaded = load_session(p.wstring());
-    REQUIRE(loaded.records.at(1).captures.back().bytes.empty());
-    REQUIRE(loaded.records.at(1).captures.back().strings[0].value == "Hello");
+    REQUIRE(loaded.records.at(1).captures.back().bytes().empty());
+    REQUIRE(loaded.records.at(1).captures.back().strings()[0].value == "Hello");
     save_session(loaded, p.wstring(), false);
     REQUIRE(load_session(p.wstring()).records.size() == 1);
     nlohmann::json j;
@@ -242,6 +273,32 @@ void storage() {
         std::ifstream f(p);
         f >> j;
     }
+    auto legacy = j;
+    legacy["version"] = 1;
+    legacy["limits"].erase("stack_frames");
+    legacy["limits"].erase("retention");
+    legacy["records"][0].erase("stack");
+    legacy["records"][0].erase("stack_status");
+    {
+        std::ofstream f(p);
+        f << legacy;
+    }
+    auto old = load_session(p.wstring());
+    REQUIRE(old.records.at(1).stack_count == 0);
+    REQUIRE(old.records.at(1).captures.back().strings()[0].value == "Hello");
+    auto oversized = j;
+    oversized["records"][0]["stack"] = nlohmann::json::array({1, 2, 3, 4, 5, 6, 7, 8, 9});
+    {
+        std::ofstream f(p);
+        f << oversized;
+    }
+    bool stack_rejected = false;
+    try {
+        load_session(p.wstring());
+    } catch (...) {
+        stack_rejected = true;
+    }
+    REQUIRE(stack_rejected);
     j["records"][0]["captures"][0]["offset"] = UINT64_MAX;
     {
         std::ofstream f(p);
@@ -292,7 +349,7 @@ void live() {
     m = await(c, [](const Model &x) {
         for (auto &[_, a] : x.records)
             for (auto &p : a.captures)
-                for (auto &t : p.strings)
+                for (auto &t : p.strings())
                     if (t.encoding == "ASCII" && t.value.find("Heapglass") != std::string::npos &&
                         p.attributed)
                         return true;
@@ -332,6 +389,21 @@ void live() {
     REQUIRE(ground_address);
     REQUIRE(semantics);
     REQUIRE(compressed);
+    m = await(c, [](const Model &x) {
+        bool utf8 = false, wide = false;
+        for (const auto &[_, a] : x.records)
+            for (const auto &sample : a.captures)
+                if (sample.attributed)
+                    for (const auto &text : sample.strings()) {
+                        if (text.encoding == "UTF-8" && text.offset == 0 &&
+                            text.value == "Heapglass UTF-8 fixture: שלום 世界 😀")
+                            utf8 = true;
+                        if (text.encoding == "UTF-16LE" && text.offset == 0 &&
+                            text.value == "שלום 世界 Ελληνικά Привет 😀")
+                            wide = true;
+                    }
+        return utf8 && wide;
+    });
     c.take_snapshot("first");
     await(c, [](const Model &x) { return x.snapshots.size() == 1; });
     Sleep(600);
@@ -439,6 +511,20 @@ nlohmann::json benchmark_run(bool instrumented, unsigned repeat) {
     result["controller_peak_sampled_working_bytes"] = controller_working;
     result["events_observed"] = model->observed;
     result["events_dropped"] = model->dropped;
+    auto pipeline = controller.metrics();
+    result["collector_ms"] = double(pipeline.ingest_ticks) * 1000. / double(pipeline.frequency);
+    result["apply_ms"] = double(pipeline.apply_ticks) * 1000. / double(pipeline.frequency);
+    result["publication_ms"] = double(pipeline.publish_ticks) * 1000. / double(pipeline.frequency);
+    result["sampling_ms"] = double(pipeline.sample_ticks) * 1000. / double(pipeline.frequency);
+    result["symbols_ms"] = double(pipeline.symbol_ticks) * 1000. / double(pipeline.frequency);
+    result["controller_event_losses"] = pipeline.controller_dropped;
+    result["max_pending_events"] = pipeline.max_pending;
+    PROCESS_MEMORY_COUNTERS_EX final_memory{};
+    final_memory.cb = sizeof(final_memory);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&final_memory),
+                             sizeof(final_memory)))
+        result["controller_peak_sampled_working_bytes"] =
+            std::max(controller_working, size_t(final_memory.WorkingSetSize));
     return result;
 }
 int main(int argc, char **argv) {
@@ -461,6 +547,7 @@ int main(int argc, char **argv) {
                       << '\n';
         } else {
             allocation_semantics();
+            uncertain_boundaries();
             delayed_free_race();
             content_snapshots();
             transport();

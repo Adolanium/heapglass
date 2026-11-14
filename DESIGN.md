@@ -19,3 +19,15 @@ The native interface prioritizes dense tables and inspectable evidence. Its layo
 | Item spacing | 8 by 6 logical pixels |
 
 Fonts and style sizes scale to the initial Win32 DPI. Later DPI changes scale the current fonts and style. Dock sizes and table settings persist under `%LOCALAPPDATA%/Heapglass/layout.ini`. State text accompanies color. Tables use clipped rows and horizontal scrolling for wide metadata. No fabricated live rows appear in normal operation.
+
+## Text coverage
+
+The build enables `IMGUI_USE_WCHAR32`. The Segoe UI body atlas requests Latin, Greek, Cyrillic, Hebrew, Arabic, general punctuation and CJK ideograph ranges. At the same body size, it merges CJK glyphs from the first installed font in this order: `msyh.ttc`, `YuGothR.ttc`, `malgun.ttf`, `simsun.ttc`. If installed, Segoe UI Emoji supplies U+1F600 through U+1F6C5. Glyph availability depends on the installed fonts. Consolas remains the Hex + ASCII font.
+
+## Capacity and stack controls
+
+Limits & rules offers rolling sample retention by default or stop at capacity. The Coverage section shows sample evictions, skipped samples, collector losses, target queue depth and queued analysis alongside retained bytes and the selected retention mode. Budget exhaustion displays an explicit sampling-stopped message with the available recovery actions.
+
+Optional stack capture accepts zero through eight frames and is disabled by default. Coverage shows the active frame count and reports native unwinder validation failure. The Inspector's Stack tab lists captured addresses and live symbols, or saved addresses in an offline session, including allocations with no byte samples. It explains when capture is disabled, rejected or unavailable.
+
+UI checks queue keyboard and mouse events through ImGui. Native dialog and synthetic DPI checks run on an unshown private desktop without global desktop input.

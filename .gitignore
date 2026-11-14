@@ -9,4 +9,5 @@ Heapglass.ini
 *.ui-profile.json
 Heapglass.allocations.png
 Heapglass.memory-map.png
+Heapglass.stack.png
 capture-error.txt

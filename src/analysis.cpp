@@ -10,7 +10,8 @@ namespace hg {
 Limits validated_limits(Limits l) {
     if (l.per_allocation < 16 || l.per_allocation > 1024 * 1024 || l.per_scan < l.per_allocation ||
         l.per_scan > 16 * 1024 * 1024 || l.per_session < l.per_scan || l.per_session > 256 * 1024 * 1024 ||
-        l.sample_ms < 50 || l.sample_ms > 60000 || l.min_string < 2 || l.min_string > 256 ||
+        l.sample_ms < 50 || l.sample_ms > 60000 || l.stack_frames > max_stack_frames ||
+        uint32_t(l.retention) > 1 || l.min_string < 2 || l.min_string > 256 ||
         !std::isfinite(l.high_entropy) || l.high_entropy < 0 || l.high_entropy > 8 ||
         !std::isfinite(l.changed_fraction) || l.changed_fraction < 0 || l.changed_fraction > 1 ||
         !std::isfinite(l.entropy_change) || l.entropy_change < 0 || l.entropy_change > 8)
@@ -82,68 +83,18 @@ uint64_t content_hash(std::span<const uint8_t> b) {
     }
     return h;
 }
-static void utf8(std::string &s, uint32_t c) {
-    if (c < 128)
-        s += char(c);
-    else if (c < 2048) {
-        s += char(0xc0 | (c >> 6));
-        s += char(0x80 | (c & 63));
-    } else if (c < 65536) {
-        s += char(0xe0 | (c >> 12));
-        s += char(0x80 | ((c >> 6) & 63));
-        s += char(0x80 | (c & 63));
-    } else {
-        s += char(0xf0 | (c >> 18));
-        s += char(0x80 | ((c >> 12) & 63));
-        s += char(0x80 | ((c >> 6) & 63));
-        s += char(0x80 | (c & 63));
-    }
+const std::vector<uint8_t> &Capture::bytes() const {
+    static const std::vector<uint8_t> empty;
+    return content ? content->bytes : empty;
 }
-std::vector<Text> extract_strings(std::span<const uint8_t> b, size_t minimum) {
-    minimum = std::max<size_t>(2, minimum);
-    std::vector<Text> out;
-    for (size_t i = 0; i < b.size();) {
-        auto start = i;
-        while (i < b.size() && b[i] >= 32 && b[i] < 127)
-            ++i;
-        if (i - start >= minimum)
-            out.push_back(
-                {start, "ASCII", std::string(reinterpret_cast<const char *>(b.data() + start), i - start)});
-        if (i == start)
-            ++i;
-    }
-    // Scan both byte alignments. Accept printable scalar values; reject isolated surrogates.
-    for (size_t alignment = 0; alignment < 2; ++alignment)
-        for (size_t i = alignment; i + 1 < b.size();) {
-            auto start = i;
-            size_t count = 0;
-            std::string s;
-            while (i + 1 < b.size()) {
-                uint32_t c = b[i] | (uint32_t(b[i + 1]) << 8);
-                size_t step = 2;
-                if (c >= 0xd800 && c <= 0xdbff && i + 3 < b.size()) {
-                    uint32_t lo = b[i + 2] | (uint32_t(b[i + 3]) << 8);
-                    if (lo < 0xdc00 || lo > 0xdfff)
-                        break;
-                    c = 0x10000 + ((c - 0xd800) << 10) + (lo - 0xdc00);
-                    step = 4;
-                } else if (c >= 0xd800 && c <= 0xdfff)
-                    break;
-                if (c < 32 || c == 127 || c == 0xfffe || c == 0xffff)
-                    break;
-                // Arbitrary binary words are not useful UTF-16 strings. Require a Latin start.
-                if (count == 0 && c > 0x24f)
-                    break;
-                utf8(s, c);
-                i += step;
-                ++count;
-            }
-            if (count >= minimum)
-                out.push_back({start, "UTF-16LE", std::move(s)});
-            if (i == start)
-                i += 2;
-        }
-    return out;
+const std::vector<Text> &Capture::strings() const {
+    static const std::vector<Text> empty;
+    return content ? content->strings : empty;
+}
+void Capture::set_bytes(std::vector<uint8_t> bytes) {
+    auto value = std::make_shared<CapturedContent>();
+    value->bytes = std::move(bytes);
+    content = std::move(value);
 }
 void Model::loss(uint64_t n, uint64_t through) {
     if (n > dropped) {
@@ -159,9 +110,14 @@ void Model::boundary() {
             a.life = Life::uncertain;
 }
 void Model::apply(const Event &e) {
-    if (!e.begin || e.end <= e.begin || uint32_t(e.op) > uint32_t(Op::destroy_heap)) {
+    if (!e.begin || e.end <= e.begin || uint32_t(e.op) > uint32_t(Op::destroy_heap) ||
+        e.stack_count > max_stack_frames || e.stack_status > 2 || e.reserved > 3) {
         loss(dropped + 1);
         return;
+    }
+    if (e.reserved & 2) {
+        unsafe_through = std::max(unsafe_through, e.end);
+        boundary();
     }
     ++observed;
     events.push_back(e);
@@ -179,6 +135,9 @@ void Model::apply(const Event &e) {
         for (auto &[_, a] : records)
             if (a.heap == heap_handle && a.life != Life::freed)
                 a.life = Life::uncertain;
+        for (auto it = live.lower_bound({heap_handle, 0});
+             it != live.end() && it->first.first == heap_handle;)
+            it = live.erase(it);
         h = {next_heap++, e.end, false};
         prune();
         return;
@@ -191,17 +150,29 @@ void Model::apply(const Event &e) {
             a.life = Life::uncertain;
             return false;
         }
+        if (a.life == Life::uncertain) {
+            a.died = 0;
+            a.end_order = e.end;
+            return true;
+        }
         a.life = Life::freed;
         a.died = e.ticks;
         a.end_order = e.end;
+        retired_records.insert(a.id.generation);
         return true;
     };
     if (e.op == Op::destroy_heap) {
         if (e.result != 0)
             return; // RtlDestroyHeap returns NULL on success.
         for (auto &[_, a] : records)
-            if (a.heap == e.heap && a.life != Life::freed)
-                retire(a);
+            if (a.heap == e.heap && a.life != Life::freed) {
+                if (retire(a)) {
+                    auto active_key = std::make_pair(a.heap, a.address);
+                    auto active = live.find(active_key);
+                    if (active != live.end() && active->second == a.id.generation)
+                        live.erase(active);
+                }
+            }
         h.dead = true;
         h.end_order = std::max(h.end_order, e.end);
         prune();
@@ -216,7 +187,7 @@ void Model::apply(const Event &e) {
         return; // Failed reallocation leaves original record intact, including zero-size failures.
     uint64_t parent = 0;
     bool ambiguous = e.begin <= unsafe_through || e.begin < h.end_order || h.dead;
-    std::deque<SizePoint> history;
+    std::vector<SizePoint> history;
     if (e.op == Op::reallocate && prior) {
         if (e.begin <= prior->end_order) {
             prior->life = Life::uncertain;
@@ -224,14 +195,19 @@ void Model::apply(const Event &e) {
         } else if (e.result == e.previous) {
             prior->size = e.requested;
             prior->caller = e.caller;
+            prior->stack = e.stack;
+            prior->stack_count = e.stack_count;
+            prior->stack_status = e.stack_status;
             prior->end_order = e.end;
             prior->history.push_back({e.ticks, e.requested, e.result});
             while (prior->history.size() > 64)
-                prior->history.pop_front();
+                prior->history.erase(prior->history.begin());
             return;
         } else {
-            parent = prior->id.generation;
-            history = prior->history;
+            if (prior->life == Life::live) {
+                parent = prior->id.generation;
+                history = prior->history;
+            }
             if (retire(*prior))
                 live.erase(key);
         }
@@ -259,9 +235,12 @@ void Model::apply(const Event &e) {
     a.begin_order = e.begin;
     a.end_order = e.end;
     a.caller = e.caller;
+    a.stack = e.stack;
+    a.stack_count = e.stack_count;
+    a.stack_status = e.stack_status;
     a.thread = e.thread;
     a.parent = parent;
-    a.birth_known = e.op == Op::allocate || prior != nullptr;
+    a.birth_known = (e.op == Op::allocate || prior != nullptr) && e.begin > unsafe_through;
     a.life = ambiguous ? Life::uncertain : Life::live;
     a.history = std::move(history);
     a.history.push_back({e.ticks, e.requested, e.result});
@@ -281,22 +260,59 @@ void Model::prune() {
         ++evicted;
     }
     while (records.size() > limits.records) {
-        auto victim = std::find_if(records.begin(), records.end(),
-                                   [](const auto &p) { return p.second.life == Life::freed; });
-        if (victim == records.end())
-            victim = records.begin();
+        auto victim = retired_records.empty() ? records.begin() : records.find(*retired_records.begin());
         auto id = victim->first;
+        retired_records.erase(id);
         auto key = std::make_pair(victim->second.heap, victim->second.address);
         auto l = live.find(key);
         if (l != live.end() && l->second == id)
             live.erase(l);
-        for (const auto &c : victim->second.captures)
-            retained_bytes -= c.bytes.size();
+        for (const auto &c : victim->second.captures) {
+            retained_bytes -= c.bytes().size();
+            capture_owners.erase(c.sequence);
+        }
         watched.erase(id);
         records.erase(victim);
         ++evicted;
         incomplete = true;
     }
+}
+void Model::rebuild_retention() {
+    capture_owners.clear();
+    retired_records.clear();
+    retained_bytes = 0;
+    next_capture = 1;
+    std::vector<std::pair<uint64_t, Capture *>> ordered;
+    for (auto &[id, a] : records) {
+        if (a.life == Life::freed)
+            retired_records.insert(id);
+        for (auto &c : a.captures)
+            ordered.push_back({id, &c});
+    }
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [](auto a, auto b) { return a.second->begin < b.second->begin; });
+    for (auto [id, c] : ordered) {
+        c->sequence = next_capture++;
+        capture_owners.emplace(c->sequence, id);
+        retained_bytes += c->bytes().size();
+    }
+}
+void Model::trim_captures() {
+    auto evict = [&](Allocation &a) {
+        auto &c = a.captures.front();
+        retained_bytes -= c.bytes().size();
+        capture_owners.erase(c.sequence);
+        a.captures.erase(a.captures.begin());
+        ++evicted_captures;
+    };
+    for (auto &[_, a] : records)
+        while (a.captures.size() > limits.captures)
+            evict(a);
+    while (retained_bytes > limits.per_session && !capture_owners.empty()) {
+        auto id = capture_owners.begin()->second;
+        evict(records.at(id));
+    }
+    sampling_budget_exhausted = false;
 }
 void Model::capture(uint64_t gen, Capture c) {
     auto it = records.find(gen);
@@ -305,26 +321,84 @@ void Model::capture(uint64_t gen, Capture c) {
     auto &a = it->second;
     if (a.life != Life::live) {
         c.attributed = false;
-        c.note = "Lifetime is uncertain or ended during acquisition";
+        c.note = "Lifetime changed around acquisition; attribution invalidated";
     }
     if (!c.allocation_size)
         c.allocation_size = a.size;
-    c.sampled_size = c.bytes.size();
-    c.entropy = entropy(c.bytes);
-    c.hash = content_hash(c.bytes);
-    c.strings = extract_strings(c.bytes, limits.min_string);
-    if (retained_bytes + c.bytes.size() > limits.per_session)
+    auto evict = [&](Allocation &victim) {
+        auto &old = victim.captures.front();
+        retained_bytes -= old.bytes().size();
+        capture_owners.erase(old.sequence);
+        victim.captures.erase(victim.captures.begin());
+        ++evicted_captures;
+    };
+    while (a.captures.size() >= limits.captures && !a.captures.empty())
+        evict(a);
+    if (c.bytes().size() > limits.per_session) {
+        sampling_budget_exhausted = true;
+        ++skipped_captures;
         return;
-    retained_bytes += c.bytes.size();
-    a.captures.push_back(std::move(c));
-    while (a.captures.size() > limits.captures) {
-        retained_bytes -= a.captures.front().bytes.size();
-        a.captures.pop_front();
     }
+    if (limits.retention == Retention::rolling)
+        while (retained_bytes + c.bytes().size() > limits.per_session && !capture_owners.empty())
+            evict(records.at(capture_owners.begin()->second));
+    if (retained_bytes + c.bytes().size() > limits.per_session) {
+        sampling_budget_exhausted = true;
+        ++skipped_captures;
+        return;
+    }
+    sampling_budget_exhausted = false;
+    auto content = std::make_shared<CapturedContent>();
+    content->bytes = c.bytes();
+    content->strings = extract_strings(content->bytes, limits.min_string);
+    c.content = std::move(content);
+    c.sampled_size = c.bytes().size();
+    c.entropy = entropy(c.bytes());
+    c.hash = content_hash(c.bytes());
+    c.sequence = next_capture++;
+    capture_owners.emplace(c.sequence, gen);
+    retained_bytes += c.bytes().size();
+    a.captures.push_back(std::move(c));
+}
+Model Model::presentation() const {
+    Model m;
+    m.session = session;
+    m.frequency = frequency;
+    m.started = started;
+    m.dropped = dropped;
+    m.observed = observed;
+    m.evicted = evicted;
+    m.retained_bytes = retained_bytes;
+    m.pid = pid;
+    m.creation = creation;
+    m.process = process;
+    m.status = status;
+    m.start_time = start_time;
+    m.incomplete = incomplete;
+    m.recording = recording;
+    m.connected = connected;
+    m.offline = offline;
+    m.sampling_budget_exhausted = sampling_budget_exhausted;
+    m.evicted_captures = evicted_captures;
+    m.skipped_captures = skipped_captures;
+    m.controller_dropped = controller_dropped;
+    m.transport_pending = transport_pending;
+    m.analysis_pending = analysis_pending;
+    m.active_stack_frames = active_stack_frames;
+    m.stack_state = stack_state;
+    m.stack_violations = stack_violations;
+    m.limits = limits;
+    m.records = records;
+    m.events = events;
+    m.regions = regions;
+    m.findings = findings;
+    m.snapshots = snapshots;
+    m.watched = watched;
+    return m;
 }
 static bool compatible(const Capture &a, const Capture &b) {
-    return a.attributed && b.attributed && a.offset == b.offset && !a.bytes.empty() &&
-           a.bytes.size() == b.bytes.size();
+    return a.attributed && b.attributed && a.offset == b.offset && !a.bytes().empty() &&
+           a.bytes().size() == b.bytes().size();
 }
 void Model::analyze() {
     findings.clear();
@@ -339,21 +413,21 @@ void Model::analyze() {
             findings.push_back({std::move(rule), std::move(title), std::move(evidence), std::move(confidence),
                                 a.address + c.offset, c.begin, c.end, gen});
         };
-        if (c.bytes.size() >= 256 && c.entropy >= limits.high_entropy)
+        if (c.bytes().size() >= 256 && c.entropy >= limits.high_entropy)
             add("content.entropy/v1", "High-entropy sampled content",
-                std::to_string(c.bytes.size()) + " sampled bytes; entropy " + std::to_string(c.entropy) +
+                std::to_string(c.bytes().size()) + " sampled bytes; entropy " + std::to_string(c.entropy) +
                     " bits/byte. Encryption, compression and random data can all produce this property.");
         if (a.captures.size() > 1) {
             const auto &p = a.captures[a.captures.size() - 2];
             if (compatible(p, c)) {
                 size_t changed = 0;
-                for (size_t i = 0; i < c.bytes.size(); ++i)
-                    changed += c.bytes[i] != p.bytes[i];
-                const double fraction = double(changed) / double(c.bytes.size());
+                for (size_t i = 0; i < c.bytes().size(); ++i)
+                    changed += c.bytes()[i] != p.bytes()[i];
+                const double fraction = double(changed) / double(c.bytes().size());
                 if (fraction >= limits.changed_fraction ||
                     std::abs(c.entropy - p.entropy) >= limits.entropy_change) {
                     add("content.change/v1", "Large sampled content change",
-                        std::to_string(changed) + " of " + std::to_string(c.bytes.size()) +
+                        std::to_string(changed) + " of " + std::to_string(c.bytes().size()) +
                             " like-for-like bytes changed; entropy delta " +
                             std::to_string(c.entropy - p.entropy) +
                             ". Samples do not identify the writer or count intervening writes.");
@@ -370,13 +444,13 @@ void Model::analyze() {
                 std::to_string(changes) +
                     " changes between compatible captures. No algorithm is established.");
             findings.back().begin = a.captures.front().begin;
-            if (c.bytes.size() >= 256 && c.entropy >= limits.high_entropy)
+            if (c.bytes().size() >= 256 && c.entropy >= limits.high_entropy)
                 add("content.crypto-hypothesis/v1", "Possible crypto-related change pattern",
                     "Repeated transformations temporally coincide with high-entropy samples of this buffer. "
                     "Compression or random replacement are alternatives; no cryptographic operation or key "
                     "rotation is established.",
                     "low");
-            if (c.bytes.size() >= 256 && c.entropy >= limits.high_entropy)
+            if (c.bytes().size() >= 256 && c.entropy >= limits.high_entropy)
                 findings.back().begin = a.captures.front().begin;
         }
     }
@@ -441,8 +515,8 @@ std::vector<Difference> compare(const Snapshot &a, const Snapshot &b) {
                     compatible(l.captures.back(), r->captures.back())) {
                     const auto &x = l.captures.back();
                     const auto &y = r->captures.back();
-                    for (size_t i = 0; i < x.bytes.size(); ++i)
-                        if (x.bytes[i] != y.bytes[i])
+                    for (size_t i = 0; i < x.bytes().size(); ++i)
+                        if (x.bytes()[i] != y.bytes()[i])
                             d.byte_offsets.push_back(x.offset + i);
                 }
             } else if (l.captures.empty() || r->captures.empty() ||
@@ -451,9 +525,9 @@ std::vector<Difference> compare(const Snapshot &a, const Snapshot &b) {
             else {
                 const auto &x = l.captures.back();
                 const auto &y = r->captures.back();
-                d.change = x.bytes == y.bytes ? Change::unchanged : Change::modified;
-                for (size_t i = 0; i < x.bytes.size(); ++i)
-                    if (x.bytes[i] != y.bytes[i])
+                d.change = x.bytes() == y.bytes() ? Change::unchanged : Change::modified;
+                for (size_t i = 0; i < x.bytes().size(); ++i)
+                    if (x.bytes()[i] != y.bytes()[i])
                         d.byte_offsets.push_back(x.offset + i);
             }
         }

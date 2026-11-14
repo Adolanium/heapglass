@@ -11,6 +11,7 @@
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 #include "ui.hpp"
+#include "desktop.hpp"
 #include <algorithm>
 #include <d3d11.h>
 #include <filesystem>
@@ -83,7 +84,27 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR command_line, int) {
     auto font_directory = std::filesystem::path(windows_directory) / L"Fonts";
     auto body_font = hg::narrow((font_directory / L"segoeui.ttf").wstring());
     auto hex_font = hg::narrow((font_directory / L"consola.ttf").wstring());
-    io.Fonts->AddFontFromFileTTF(body_font.c_str(), 15.0f * dpi);
+    static const ImWchar body_ranges[] = {0x20, 0x024f, 0x0370, 0x06ff, 0x2000, 0x206f, 0x4e00, 0x9fff, 0};
+    io.Fonts->AddFontFromFileTTF(body_font.c_str(), 15.0f * dpi, nullptr, body_ranges);
+    static const ImWchar cjk_ranges[] = {0x2e80, 0x9fff, 0};
+    for (auto name : {L"msyh.ttc", L"YuGothR.ttc", L"malgun.ttf", L"simsun.ttc"}) {
+        auto path = font_directory / name;
+        if (std::filesystem::is_regular_file(path)) {
+            ImFontConfig config;
+            config.MergeMode = true;
+            auto utf8 = hg::narrow(path.wstring());
+            io.Fonts->AddFontFromFileTTF(utf8.c_str(), 15.0f * dpi, &config, cjk_ranges);
+            break;
+        }
+    }
+    auto emoji = font_directory / L"seguiemj.ttf";
+    if (std::filesystem::is_regular_file(emoji)) {
+        static const ImWchar ranges[] = {0x1f600, 0x1f6c5, 0};
+        ImFontConfig config;
+        config.MergeMode = true;
+        auto utf8 = hg::narrow(emoji.wstring());
+        io.Fonts->AddFontFromFileTTF(utf8.c_str(), 15.0f * dpi, &config, ranges);
+    }
     io.Fonts->AddFontFromFileTTF(hex_font.c_str(), 14.0f * dpi);
     ImGuiStyle &style = ImGui::GetStyle();
     style.WindowRounding = 0;
@@ -119,9 +140,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR command_line, int) {
     hg::UI app;
     unsigned capture_stage = 0;
     auto run_start = GetTickCount64();
-    if (capture_run)
+    if (capture_run) {
+        hg::Limits limits;
+        limits.stack_frames = 8;
+        app.controller.configure(limits);
         app.controller.launch(hg::executable_directory() + L"\\HeapglassTarget.exe", L"--duration 20");
-    else if (command_line && wcsstr(command_line, L"--test-target"))
+    } else if (command_line && wcsstr(command_line, L"--test-target"))
         app.auto_target();
     ImVec4 clear_color = ImVec4(.04f, .05f, .065f, 1);
 
@@ -188,19 +212,24 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR command_line, int) {
         }
 
         if (capture_run && ((capture_stage == 0 && GetTickCount64() - run_start > 8000) ||
-                            (capture_stage == 1 && GetTickCount64() - run_start > 12000))) {
+                            (capture_stage == 1 && GetTickCount64() - run_start > 12000) ||
+                            (capture_stage == 2 && GetTickCount64() - run_start > 16000))) {
             try {
-                auto path = hg::executable_directory() +
-                            (capture_stage ? L"\\Heapglass.memory-map.png" : L"\\Heapglass.allocations.png");
+                auto path = hg::executable_directory() + (capture_stage == 0 ? L"\\Heapglass.allocations.png"
+                                                          : capture_stage == 1 ? L"\\Heapglass.memory-map.png"
+                                                                               : L"\\Heapglass.stack.png");
                 save_rendered_frame(g_pSwapChain, g_pd3dDevice, g_pd3dDeviceContext, path.c_str());
             } catch (const std::exception &e) {
                 std::ofstream error{std::filesystem::path(hg::executable_directory()) / L"capture-error.txt"};
                 error << e.what();
             }
-            if (capture_stage++ == 0)
+            if (capture_stage == 0)
                 app.show_memory_map();
+            else if (capture_stage == 1)
+                app.show_allocation_stack();
             else
                 done = true;
+            ++capture_stage;
         }
         // Present
         HRESULT hr = g_pSwapChain->Present(1, 0); // Present with vsync
@@ -340,15 +369,8 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_DPICHANGED:
         if (ImGui::GetCurrentContext()) {
-            float newDpi = float(HIWORD(wParam)) / 96.0f;
-            ImGui::GetIO().FontGlobalScale = newDpi / g_fontDpi;
-            ImGui::GetStyle().ScaleAllSizes(newDpi / g_styleDpi);
-            g_styleDpi = newDpi;
-            // printf("WM_DPICHANGED to %d (%.0f%%)\n", dpi, (float)dpi / 96.0f * 100.0f);
-            const RECT *suggested_rect = (RECT *)lParam;
-            ::SetWindowPos(hWnd, nullptr, suggested_rect->left, suggested_rect->top,
-                           suggested_rect->right - suggested_rect->left,
-                           suggested_rect->bottom - suggested_rect->top, SWP_NOZORDER | SWP_NOACTIVATE);
+            hg::apply_dpi(hWnd, HIWORD(wParam), g_fontDpi, g_styleDpi,
+                          reinterpret_cast<const RECT *>(lParam));
         }
         break;
     }

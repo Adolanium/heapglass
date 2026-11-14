@@ -8,19 +8,34 @@ class UI {
     void draw();
     void auto_target();
     void show_memory_map();
+    void show_allocation_stack();
 
   private:
     std::shared_ptr<const Model> shown;
     bool display_paused = false, include_bytes = false, show_attach = false, show_launch = false,
          show_limits = false, regions_view = false;
-    uint64_t selected = 0, heap_filter = 0, region_selected = 0, min_address = 0, max_address = UINT64_MAX,
-             min_size = 0, max_size = UINT64_MAX;
+    uint64_t selected = 0, region_selected = 0;
+    struct Filter {
+        uint64_t heap = 0, min_address = 0, max_address = UINT64_MAX, min_size = 0, max_size = UINT64_MAX;
+        int state = 0, thread = 0, min_lifetime = 0;
+        float entropy = 0;
+        std::string text, protection, finding;
+        auto operator<=>(const Filter &) const = default;
+    };
+    uint64_t heap_filter = 0, min_address = 0, max_address = UINT64_MAX, min_size = 0, max_size = UINT64_MAX;
     int state_filter = 0, thread_filter = 0, min_lifetime = 0, capture_index = -1, snap_a = 0, snap_b = 1,
         inspecting_snapshot = -1;
     float entropy_filter = 0;
     char search[256]{}, permission_filter[32]{}, finding_filter[128]{},
         snapshot_name[128] = "Snapshot", launch_path[1024]{}, launch_args[1024]{}, launch_cwd[1024]{};
+    std::shared_ptr<const Model> row_owner;
+    Filter row_filter;
+    std::vector<const Allocation *> row_cache;
+    int sorted_column = -1;
+    bool sorted_ascending = true;
+    bool select_stack_tab = false;
     std::string ui_error;
+    std::wstring choose_file(bool save, const wchar_t *filter, const wchar_t *extension);
     void menu();
     void sidebar();
     void allocation_table();

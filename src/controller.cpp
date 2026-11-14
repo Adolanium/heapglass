@@ -117,7 +117,10 @@ std::string protection_name(uint32_t p) {
         s += " guard";
     return s;
 }
-Controller::Controller() {
+Controller::Controller(std::wstring filename) : agent_filename(std::move(filename)) {
+    if (std::filesystem::path(agent_filename).filename() != agent_filename ||
+        std::filesystem::path(agent_filename).extension() != L".dll")
+        throw std::invalid_argument("Agent filename must be a DLL beside the executable");
     published.store(std::make_shared<const Model>(model));
     worker = std::jthread([this](std::stop_token t) { loop(t); });
 }
@@ -169,9 +172,12 @@ void Controller::disconnect() {
 void Controller::record(bool enabled) {
     enqueue([this, enabled] {
         if (shared) {
-            InterlockedExchange(&shared->recording, enabled ? 1 : 0);
+            InterlockedExchange(&shared->recording, 0);
             drain();
             model.boundary();
+            model.unsafe_through = std::max(model.unsafe_through, uint64_t(atomic_read(&shared->clock)));
+            if (enabled)
+                InterlockedExchange(&shared->recording, 1);
             model.recording = enabled;
             model.status = enabled ? "Recording resumed; earlier coverage gap remains"
                                    : "Recording stopped; target continues; agent resident";
@@ -186,14 +192,16 @@ void Controller::take_snapshot(std::string name) {
         size_t bytes = 0;
         for (auto &a : s.records) {
             while (a.captures.size() > 1)
-                a.captures.pop_front();
+                a.captures.erase(a.captures.begin());
             for (auto &c : a.captures) {
-                if (bytes + c.bytes.size() > 8 * 1024 * 1024) {
-                    c.bytes.clear();
+                if (bytes + c.bytes().size() > 8 * 1024 * 1024) {
+                    auto content = std::make_shared<CapturedContent>();
+                    content->strings = c.strings();
+                    c.content = std::move(content);
                     c.attributed = false;
                     c.note = "Snapshot byte retention limit";
                 }
-                bytes += c.bytes.size();
+                bytes += c.bytes().size();
             }
         }
         model.snapshots.push_back(std::move(s));
@@ -211,7 +219,16 @@ void Controller::watch(uint64_t g, bool enabled) {
     });
 }
 void Controller::configure(Limits l) {
-    enqueue([this, l] { model.limits = validated_limits(l); });
+    enqueue([this, l] {
+        auto validated = validated_limits(l);
+        if (shared && validated.stack_frames && atomic_read(&shared->stack_ready) != 1)
+            throw std::runtime_error("Bounded stack capture did not pass the agent allocation-free probe");
+        desired_limits = validated;
+        model.limits = validated;
+        model.trim_captures();
+        if (shared)
+            InterlockedExchange(&shared->stack_frames, validated.stack_frames);
+    });
 }
 void Controller::sample_now() {
     enqueue([this] { force_sample = true; });
@@ -237,15 +254,74 @@ void Controller::csv(std::wstring path) {
     });
 }
 void Controller::stall_ingestion(unsigned ms) {
-    enqueue([this, ms] {
-        if (shared)
-            InterlockedExchange64(&shared->heartbeat, GetTickCount64());
-        Sleep(std::min(ms, 2000u));
-    });
+    stall_until.store(GetTickCount64() + std::min(ms, 2000u));
+}
+PipelineMetrics Controller::metrics() const {
+    LARGE_INTEGER f{};
+    QueryPerformanceFrequency(&f);
+    return {uint64_t(f.QuadPart), ingest_ticks.load(), apply_ticks.load(),   publish_ticks.load(),
+            sample_ticks.load(),  symbol_ticks.load(), local_dropped.load(), max_pending.load()};
+}
+void Controller::collect(std::stop_token stop, HANDLE idle_timer) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    uint64_t heartbeat = 0;
+    for (;;) {
+        auto now = GetTickCount64();
+        if (now - heartbeat >= 100) {
+            WriteRelease64(&shared->heartbeat, now);
+            heartbeat = now;
+        }
+        if (!stop.stop_requested() && now < stall_until.load()) {
+            Sleep(1);
+            continue;
+        }
+        auto begin = ticks();
+        size_t count = 0;
+        while (count < 65536 && transfer(
+                                    shared,
+                                    [&](const Event &event) {
+                                        auto write = pending_write.load(std::memory_order_relaxed);
+                                        auto read = pending_read.load(std::memory_order_acquire);
+                                        if (write - read >= pending_capacity)
+                                            ++local_dropped;
+                                        else {
+                                            pending_events[write % pending_capacity] = event;
+                                            pending_write.store(write + 1, std::memory_order_release);
+                                            auto size = write + 1 - read;
+                                            if (size > max_pending.load(std::memory_order_relaxed))
+                                                max_pending.store(size, std::memory_order_relaxed);
+                                        }
+                                    })) {
+            ++count;
+        }
+        ingest_ticks.fetch_add(ticks() - begin, std::memory_order_relaxed);
+        if (stop.stop_requested() && !count)
+            break;
+        if (!count)
+            WaitForSingleObject(idle_timer, INFINITE);
+    }
+}
+void Controller::stop_collector() {
+    if (collector.joinable()) {
+        collector.request_stop();
+        collector.join();
+    }
 }
 void Controller::publish() {
-    published.store(std::make_shared<const Model>(model));
+    if (shared) {
+        model.active_stack_frames = atomic_read(&shared->stack_frames);
+        auto state = atomic_read(&shared->stack_ready);
+        model.stack_state = state == 1 ? 1 : state < 0 ? 2 : 0;
+        model.stack_violations = atomic_read(&shared->stack_violations);
+    }
+    auto begin = ticks();
+    model.controller_dropped = local_dropped.load();
+    model.analysis_pending = pending_write.load() - pending_read.load();
+    model.transport_pending = shared ? uint64_t(atomic_read(&shared->write) - atomic_read(&shared->read)) : 0;
+    published.store(std::make_shared<const Model>(model.presentation()));
+    publish_ticks.fetch_add(ticks() - begin, std::memory_order_relaxed);
     last_publish = GetTickCount64();
+    dirty = false;
 }
 void Controller::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
@@ -264,9 +340,10 @@ void Controller::loop(std::stop_token stop) {
             }
         try {
             if (shared) {
-                InterlockedExchange64(&shared->heartbeat, GetTickCount64());
                 if (WaitForSingleObject(process_handle, 0) == WAIT_OBJECT_0) {
-                    drain();
+                    stop_collector();
+                    while (pending_read.load() != pending_write.load())
+                        drain();
                     close();
                     model.status = "Target exited; retained observations available";
                     publish();
@@ -274,7 +351,9 @@ void Controller::loop(std::stop_token stop) {
                     drain();
                     auto now = GetTickCount64();
                     if (force_sample || now - last_sample >= model.limits.sample_ms) {
+                        auto b = ticks();
                         sample();
+                        sample_ticks.fetch_add(ticks() - b, std::memory_order_relaxed);
                         force_sample = false;
                         last_sample = now;
                     }
@@ -282,17 +361,20 @@ void Controller::loop(std::stop_token stop) {
                         memory_map();
                         last_region = now;
                         model.analyze();
+                        dirty = true;
                     }
+                    auto b = ticks();
                     resolve();
+                    symbol_ticks.fetch_add(ticks() - b, std::memory_order_relaxed);
                 }
             }
-            if (GetTickCount64() - last_publish >= 250)
+            if (dirty && GetTickCount64() - last_publish >= 250)
                 publish();
         } catch (const std::exception &e) {
             model.status = e.what();
             publish();
         }
-        Sleep(10);
+        Sleep(pending_write.load() != pending_read.load() ? 0 : 1);
     }
 }
 static uint64_t remote_module(DWORD pid, const std::wstring &filename) {
@@ -311,6 +393,61 @@ static uint64_t remote_module(DWORD pid, const std::wstring &filename) {
         } while (Module32NextW(s, &m));
     CloseHandle(s);
     return base;
+}
+static uint64_t remote_export(HANDLE process, uint64_t base, const char *wanted) {
+    auto read = [&](uint64_t address, void *buffer, size_t count) {
+        SIZE_T got = 0;
+        return address <= UINT64_MAX - count &&
+               ReadProcessMemory(process, reinterpret_cast<LPCVOID>(address), buffer, count, &got) &&
+               got == count;
+    };
+    IMAGE_DOS_HEADER dos{};
+    if (!read(base, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 64 ||
+        dos.e_lfanew > 1024 * 1024)
+        return 0;
+    IMAGE_NT_HEADERS64 nt{};
+    if (!read(base + dos.e_lfanew, &nt, sizeof(nt)) || nt.Signature != IMAGE_NT_SIGNATURE ||
+        nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        nt.OptionalHeader.SizeOfImage > 256 * 1024 * 1024)
+        return 0;
+    auto size = nt.OptionalHeader.SizeOfImage;
+    auto directory = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    auto range = [&](uint64_t rva, size_t count) {
+        return rva < size && count <= size - rva && base <= UINT64_MAX - rva;
+    };
+    IMAGE_EXPORT_DIRECTORY exports{};
+    if (!range(directory.VirtualAddress, sizeof(exports)) ||
+        !range(directory.VirtualAddress, directory.Size) ||
+        !read(base + directory.VirtualAddress, &exports, sizeof(exports)) || exports.NumberOfNames > 4096 ||
+        exports.NumberOfFunctions > 4096)
+        return 0;
+    std::vector<DWORD> names(exports.NumberOfNames), functions(exports.NumberOfFunctions);
+    std::vector<WORD> ordinals(exports.NumberOfNames);
+    if (!range(exports.AddressOfNames, names.size() * 4) ||
+        !range(exports.AddressOfFunctions, functions.size() * 4) ||
+        !range(exports.AddressOfNameOrdinals, ordinals.size() * 2) ||
+        !read(base + exports.AddressOfNames, names.data(), names.size() * 4) ||
+        !read(base + exports.AddressOfFunctions, functions.data(), functions.size() * 4) ||
+        !read(base + exports.AddressOfNameOrdinals, ordinals.data(), ordinals.size() * 2))
+        return 0;
+    for (size_t i = 0; i < names.size(); ++i) {
+        char name[128]{};
+        if (!range(names[i], 1))
+            return 0;
+        auto n = std::min<size_t>(sizeof(name) - 1, size - names[i]);
+        if (!read(base + names[i], name, n) || !memchr(name, 0, n))
+            continue;
+        if (strcmp(name, wanted) == 0) {
+            auto ordinal = ordinals[i];
+            if (ordinal >= functions.size() || !range(functions[ordinal], 1))
+                return 0;
+            auto rva = functions[ordinal];
+            if (rva >= directory.VirtualAddress && rva - directory.VirtualAddress < directory.Size)
+                return 0;
+            return base + rva;
+        }
+    }
+    return 0;
 }
 static DWORD remote_call(HANDLE process, uint64_t function, void *parameter) {
     HANDLE t = CreateRemoteThread(process, nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(function),
@@ -332,6 +469,18 @@ void Controller::connect(DWORD pid) {
         throw std::runtime_error("Self instrumentation is unsupported");
     close();
     model = Model{};
+    model.limits = desired_limits;
+    pending_read = 0;
+    pending_write = 0;
+    local_dropped = 0;
+    max_pending = 0;
+    ingest_ticks = 0;
+    apply_ticks = 0;
+    publish_ticks = 0;
+    sample_ticks = 0;
+    symbol_ticks = 0;
+    if (pending_events.empty())
+        pending_events.resize(pending_capacity);
     {
         std::lock_guard l(symbol_mutex);
         symbols.clear();
@@ -401,10 +550,10 @@ void Controller::connect(DWORD pid) {
         InterlockedExchange64(&shared->heartbeat, GetTickCount64());
         InterlockedExchange(&shared->disconnected, 0);
         InterlockedExchange(&shared->recording, 0);
-        std::wstring dll = executable_directory() + L"\\HeapglassAgent.dll";
+        std::wstring dll = executable_directory() + L"\\" + agent_filename;
         if (!std::filesystem::is_regular_file(dll))
             throw std::runtime_error("HeapglassAgent.dll is missing beside the executable");
-        uint64_t agent = remote_module(pid, L"HeapglassAgent.dll");
+        uint64_t agent = remote_module(pid, agent_filename);
         if (!agent) {
             void *remote = VirtualAllocEx(process_handle, nullptr, (dll.size() + 1) * sizeof(wchar_t),
                                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -438,19 +587,19 @@ void Controller::connect(DWORD pid) {
                         base + (reinterpret_cast<uint64_t>(loader) - reinterpret_cast<uint64_t>(owner)),
                         remote);
             VirtualFreeEx(process_handle, remote, 0, MEM_RELEASE);
-            agent = remote_module(pid, L"HeapglassAgent.dll");
+            agent = remote_module(pid, agent_filename);
             if (!agent)
                 throw std::runtime_error("Agent DLL could not load. Check signature policy, architecture and "
                                          "process restrictions.");
         }
-        HMODULE local = LoadLibraryExW(dll.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
-        check(local != nullptr, "Locate initialization export");
-        auto entry = GetProcAddress(local, "HeapglassInitialize");
-        auto offset = reinterpret_cast<uint64_t>(entry) - reinterpret_cast<uint64_t>(local);
-        FreeLibrary(local);
+        auto version_entry = remote_export(process_handle, agent, "HeapglassProtocolVersion");
+        if (!version_entry || remote_call(process_handle, version_entry, nullptr) != protocol_version)
+            throw std::runtime_error("Resident agent version is incompatible; restart the target before "
+                                     "upgrading instrumentation");
+        auto entry = remote_export(process_handle, agent, "HeapglassInitialize");
         if (!entry)
             throw std::runtime_error("Agent initialization export missing");
-        DWORD result = remote_call(process_handle, agent + offset, nullptr);
+        DWORD result = remote_call(process_handle, entry, nullptr);
         if (result || atomic_read(&shared->ready) != 1)
             throw std::runtime_error("Hook transaction failed: " +
                                      error_text(result ? result : atomic_read(&shared->error)));
@@ -484,6 +633,19 @@ void Controller::connect(DWORD pid) {
             model.dropped = atomic_read(&shared->dropped);
             model.status = "Reconnected; prior recording gap makes state incomplete";
         }
+        if (model.limits.stack_frames && atomic_read(&shared->stack_ready) != 1)
+            throw std::runtime_error("Bounded stack capture did not pass the agent allocation-free probe");
+        model.unsafe_through = atomic_read(&shared->clock);
+        InterlockedExchange(&shared->stack_frames, model.limits.stack_frames);
+        HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                              TIMER_MODIFY_STATE | SYNCHRONIZE);
+        check(timer != nullptr, "Create collector timer");
+        std::shared_ptr<void> timer_owner(timer, [](void *handle) { CloseHandle(handle); });
+        LARGE_INTEGER due{};
+        due.QuadPart = -10000;
+        check(SetWaitableTimer(timer, &due, 1, nullptr, nullptr, FALSE) != FALSE, "Set collector timer");
+        collector =
+            std::jthread([this, timer_owner](std::stop_token token) { collect(token, timer_owner.get()); });
         InterlockedExchange(&shared->recording, 1);
         last_sample = 0;
         last_region = 0;
@@ -498,6 +660,15 @@ void Controller::connect(DWORD pid) {
     }
 }
 void Controller::close() {
+    if (shared) {
+        InterlockedExchange(&shared->recording, 0);
+        InterlockedExchange(&shared->disconnected, 1);
+    }
+    stop_collector();
+    if (shared) {
+        while (pending_read.load() != pending_write.load())
+            drain();
+    }
     if (shared) {
         InterlockedExchange(&shared->recording, 0);
         InterlockedExchange(&shared->disconnected, 1);
@@ -534,15 +705,25 @@ void Controller::drain() {
         model.recording = false;
         model.status = "Recording stopped after controller heartbeat expired; coverage gap";
     }
+    auto begin = ticks();
     std::vector<Event> batch;
-    batch.reserve(4096);
-    Event e{};
-    while (batch.size() < ring_capacity && pop(shared, e))
-        batch.push_back(e);
+    auto read = pending_read.load(std::memory_order_relaxed),
+         write = pending_write.load(std::memory_order_acquire);
+    const auto count = std::min<size_t>(65536, write - read);
+    batch.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+        batch.push_back(pending_events[(read + i) % pending_capacity]);
+    pending_read.store(read + count, std::memory_order_release);
+    if (!batch.empty())
+        dirty = true;
     std::sort(batch.begin(), batch.end(), [](const Event &a, const Event &b) { return a.end < b.end; });
-    model.loss(atomic_read(&shared->dropped), atomic_read(&shared->clock));
-    for (const auto &x : batch)
-        model.apply(x);
+    auto lost = uint64_t(atomic_read(&shared->dropped)) + local_dropped.load();
+    if (lost > model.dropped)
+        dirty = true;
+    model.loss(lost, atomic_read(&shared->clock));
+    for (const auto &event : batch)
+        model.apply(event);
+    apply_ticks.fetch_add(ticks() - begin, std::memory_order_relaxed);
 }
 void Controller::sample() {
     if (!shared || !model.recording)
@@ -570,45 +751,36 @@ void Controller::sample() {
         if (a.life != Life::live || !a.size)
             continue;
         size_t n = static_cast<size_t>(std::min<uint64_t>({a.size, model.limits.per_allocation, budget}));
-        if (model.retained_bytes + n > model.limits.per_session)
+        if (model.limits.retention == Retention::stop_at_capacity &&
+            model.retained_bytes + n > model.limits.per_session &&
+            a.captures.size() < model.limits.captures) {
+            model.sampling_budget_exhausted = true;
+            ++model.skipped_captures;
+            dirty = true;
             break;
+        }
         drain();
+        auto check = model.records.find(id);
+        if (check == model.records.end() || check->second.life != Life::live ||
+            check->second.address != a.address || check->second.end_order != a.end_order)
+            continue;
         auto before = atomic_read(&shared->clock);
-        bool quiet =
-            atomic_read(&shared->active) == 0 && atomic_read(&shared->write) == atomic_read(&shared->read);
-        Capture c;
-        c.begin = ticks();
-        c.requested = n;
+        bool quiet = transport_quiet(shared) && pending_read.load() == pending_write.load();
+        Capture c = read_memory(process_handle, a.address, n);
         c.allocation_size = a.size;
-        c.truncated = n < a.size;
-        MEMORY_BASIC_INFORMATION mbi{};
-        SIZE_T got = 0;
-        if (VirtualQueryEx(process_handle, reinterpret_cast<LPCVOID>(a.address), &mbi, sizeof(mbi)) ==
-                sizeof(mbi) &&
-            mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
-            auto remain = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize - a.address;
-            n = static_cast<size_t>(std::min<uint64_t>(n, remain));
-            c.bytes.resize(n);
-            c.protection = mbi.Protect;
-            BOOL ok = ReadProcessMemory(process_handle, reinterpret_cast<LPCVOID>(a.address), c.bytes.data(),
-                                        n, &got);
-            c.bytes.resize(got);
-            if (!ok)
-                c.note = "Partial or failed ReadProcessMemory";
-        } else
-            c.note = "Inaccessible, guard, uncommitted or exited target";
-        c.end = ticks();
+        c.truncated = c.truncated || n < a.size;
         auto after = atomic_read(&shared->clock);
-        quiet = quiet && before == after && atomic_read(&shared->active) == 0;
+        quiet = quiet && before == after && transport_quiet(shared) &&
+                pending_read.load() == pending_write.load();
         drain();
         auto current = model.records.find(id);
         c.attributed = quiet && current != model.records.end() && current->second.life == Life::live &&
                        current->second.address == a.address && current->second.end_order == a.end_order;
         if (!c.attributed)
             c.note = "Concurrent heap activity or incomplete lifetime; attribution unsafe";
-        c.truncated = c.truncated || got < c.requested;
         budget -= std::min(budget, n);
         model.capture(id, std::move(c));
+        dirty = true;
         cursor = id;
     }
     model.analyze();
@@ -676,36 +848,39 @@ void Controller::resolve() {
         return;
     unsigned budget = 8;
     for (auto it = model.events.rbegin(); it != model.events.rend() && budget; ++it) {
-        if (!it->caller)
-            continue;
-        {
-            std::lock_guard l(symbol_mutex);
-            if (symbols.contains(it->caller))
+        for (uint32_t frame = 0; frame <= it->stack_count && budget; ++frame) {
+            auto address = frame ? it->stack[frame - 1] : it->caller;
+            if (!address)
                 continue;
+            {
+                std::lock_guard l(symbol_mutex);
+                if (symbols.contains(address))
+                    continue;
+            }
+            alignas(SYMBOL_INFO) std::array<uint8_t, sizeof(SYMBOL_INFO) + MAX_SYM_NAME> buffer{};
+            auto *s = reinterpret_cast<SYMBOL_INFO *>(buffer.data());
+            s->SizeOfStruct = sizeof(SYMBOL_INFO);
+            s->MaxNameLen = MAX_SYM_NAME;
+            DWORD64 offset = 0;
+            std::string value;
+            if (SymFromAddr(process_handle, address, &offset, s))
+                value = std::string(s->Name, s->NameLen) + "+" + std::to_string(offset);
+            else {
+                IMAGEHLP_MODULE64 m{};
+                m.SizeOfStruct = sizeof(m);
+                if (SymGetModuleInfo64(process_handle, address, &m))
+                    value = std::string(m.ModuleName) + "+" + std::to_string(address - m.BaseOfImage);
+                else
+                    value = "unresolved";
+            }
+            {
+                std::lock_guard l(symbol_mutex);
+                if (symbols.size() > 10000)
+                    symbols.clear();
+                symbols[address] = std::move(value);
+            }
+            --budget;
         }
-        alignas(SYMBOL_INFO) std::array<uint8_t, sizeof(SYMBOL_INFO) + MAX_SYM_NAME> buffer{};
-        auto *s = reinterpret_cast<SYMBOL_INFO *>(buffer.data());
-        s->SizeOfStruct = sizeof(SYMBOL_INFO);
-        s->MaxNameLen = MAX_SYM_NAME;
-        DWORD64 offset = 0;
-        std::string value;
-        if (SymFromAddr(process_handle, it->caller, &offset, s))
-            value = std::string(s->Name, s->NameLen) + "+" + std::to_string(offset);
-        else {
-            IMAGEHLP_MODULE64 m{};
-            m.SizeOfStruct = sizeof(m);
-            if (SymGetModuleInfo64(process_handle, it->caller, &m))
-                value = std::string(m.ModuleName) + "+" + std::to_string(it->caller - m.BaseOfImage);
-            else
-                value = "unresolved";
-        }
-        {
-            std::lock_guard l(symbol_mutex);
-            if (symbols.size() > 10000)
-                symbols.clear();
-            symbols[it->caller] = std::move(value);
-        }
-        --budget;
     }
 }
 std::string Controller::symbol(uint64_t address) const {
