@@ -113,8 +113,9 @@ class TemporaryFiles {
                      std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
         require(std::filesystem::create_directory(directory),
                 "Could not create unique dialog TEMP directory");
-        existing = directory / L"open-\u05e7\u05d5\u05d1\u05e5-\u03a9.json";
-        saved = directory / L"save-\u05e7\u05d5\u05d1\u05e5-\u03a9.json";
+        // Common dialogs can canonicalize dot components and expand a short TEMP directory name.
+        existing = directory / L"." / L"open-\u05e7\u05d5\u05d1\u05e5-\u03a9.json";
+        saved = directory / L"." / L"save-\u05e7\u05d5\u05d1\u05e5-\u03a9.json";
         std::ofstream output(existing, std::ios::binary);
         output << "owned dialog fixture\n";
         output.close();
@@ -311,9 +312,13 @@ void worker_validation() {
     require(!IsWindowVisible(windows.owner) && !IsWindowVisible(windows.subject),
             "Validation owner windows must remain hidden");
     const auto opened = choose_file(windows.subject, false, false, files.existing);
-    require(opened == files.existing.wstring(), "Native Open dialog returned the wrong Unicode path");
+    require(std::filesystem::equivalent(std::filesystem::path(opened), files.existing),
+            "Native Open dialog returned a different file");
     const auto saved = choose_file(windows.subject, true, false, files.saved);
-    require(saved == files.saved.wstring(), "Native Save dialog returned the wrong Unicode path");
+    const std::filesystem::path saved_path(saved);
+    require(saved_path.filename() == files.saved.filename() &&
+                std::filesystem::equivalent(saved_path.parent_path(), files.saved.parent_path()),
+            "Native Save dialog returned a different directory or Unicode filename");
     require(choose_file(windows.subject, false, true, files.existing).empty(),
             "Cancelling the native Open dialog returned a filename");
     require(choose_file(windows.subject, true, true, files.saved).empty(),
