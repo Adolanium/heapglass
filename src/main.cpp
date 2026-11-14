@@ -144,7 +144,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR command_line, int) {
         hg::Limits limits;
         limits.stack_frames = 8;
         app.controller.configure(limits);
-        app.controller.launch(hg::executable_directory() + L"\\HeapglassTarget.exe", L"--duration 20");
+        app.controller.launch(hg::executable_directory() + L"\\HeapglassTarget.exe", L"--duration 28");
     } else if (command_line && wcsstr(command_line, L"--test-target"))
         app.auto_target();
     ImVec4 clear_color = ImVec4(.04f, .05f, .065f, 1);
@@ -213,20 +213,31 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR command_line, int) {
 
         if (capture_run && ((capture_stage == 0 && GetTickCount64() - run_start > 8000) ||
                             (capture_stage == 1 && GetTickCount64() - run_start > 12000) ||
-                            (capture_stage == 2 && GetTickCount64() - run_start > 16000))) {
+                            (capture_stage == 2 && GetTickCount64() - run_start > 16000) ||
+                            (capture_stage == 3 && GetTickCount64() - run_start > 20000) ||
+                            (capture_stage == 4 && GetTickCount64() - run_start > 24000))) {
             try {
                 auto path = hg::executable_directory() + (capture_stage == 0 ? L"\\Heapglass.allocations.png"
                                                           : capture_stage == 1 ? L"\\Heapglass.memory-map.png"
-                                                                               : L"\\Heapglass.stack.png");
+                                                          : capture_stage == 2 ? L"\\Heapglass.stack.png"
+                                                          : capture_stage == 3 ? L"\\Heapglass.sites.png"
+                                                                               : L"\\Heapglass.growth.png");
                 save_rendered_frame(g_pSwapChain, g_pd3dDevice, g_pd3dDeviceContext, path.c_str());
             } catch (const std::exception &e) {
                 std::ofstream error{std::filesystem::path(hg::executable_directory()) / L"capture-error.txt"};
                 error << e.what();
             }
-            if (capture_stage == 0)
+            if (capture_stage == 0) {
+                app.controller.take_snapshot("Capture A");
                 app.show_memory_map();
-            else if (capture_stage == 1)
+            } else if (capture_stage == 1) {
+                app.controller.take_snapshot("Capture B");
                 app.show_allocation_stack();
+            } else if (capture_stage == 2) {
+                app.controller.take_snapshot("Capture C");
+                app.show_allocation_sites();
+            } else if (capture_stage == 3)
+                app.show_snapshot_growth();
             else
                 done = true;
             ++capture_stage;

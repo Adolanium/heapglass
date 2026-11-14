@@ -26,6 +26,7 @@ Keep `HeapglassAgent.dll` beside `Heapglass.exe`. The release build statically l
 4. Capture named snapshots. Compare them in the bottom panel. Counts distinguish samples acquired during the snapshot interval from older retained captures.
 5. Open the separate process memory map from the left panel. It reports committed private, mapped, and image regions, their protections, and available module and mapped-file associations.
 6. Use **Save session / export JSON**, **Open saved session**, or **Export allocation CSV**. Raw sampled bytes are excluded by default. Enable **Include sampled bytes in JSON** to retain them. Extracted text remains in the JSON and may contain sensitive process data.
+7. Open **Allocation sites** in the bottom panel to rank outstanding requested bytes by bounded stack or caller. Select a group to filter its allocations. Capture multiple snapshots and use **Snapshot growth** to compare counts, bytes, and surviving generations. Three clean observations can establish repeated growth as an investigation lead. Both reports support offline inspection and CSV exports. See [allocation sites and growth](docs/profiling.md).
 
 **Stop recording** stops event production, while the target continues. **Pause display** freezes presentation while ingestion continues. **Disconnect** leaves the target operational. Installed hooks and their transport remain resident until target exit; disconnection does not unload the DLL.
 
@@ -39,7 +40,7 @@ A dedicated collector drains the target ring independently of sampling and analy
 
 ASCII, validated UTF-8, and UTF-16LE extraction retain exact byte offsets. Unicode candidates use Windows character classification and a limited supplementary repertoire. Installed CJK and emoji fonts extend display coverage, but the interface has no full RTL shaping. Optional stacks are disabled by default, capped at eight frames, and require an allocation-free unwinder probe.
 
-Version 0.2 uses IPC protocol 2 and session format 2. It reads format 1 sessions. Restart targets carrying an older resident agent before attaching with this version.
+Versions 0.2 and 0.3 use IPC protocol 2 and session format 2. They read format 1 sessions. Restart targets carrying a protocol 1 resident agent before attaching.
 
 See [coverage and architecture](docs/coverage.md), [validation and measured performance](docs/validation.md), and [API references](docs/references.md). The tests and screenshots establish operation on the documented fixture, not detection of arbitrary malicious software.
 
@@ -53,6 +54,6 @@ cmake --install build --config Release --prefix out/Heapglass
 Compress-Archive -Path out/Heapglass/* -DestinationPath out/Heapglass-windows-x64.zip -Force
 ```
 
-`--capture` runs the controlled target with eight stack frames, renders the application without desktop input, exports allocation, memory-map, and stack PNGs beside the executable, and exits after about 16 seconds. The target continues until its 20-second workload finishes. `--profile` writes CPU draw-time and frame-time measurements on clean UI exit. `--test-target` opens the ordinary interface against a 180-second fixture.
+`--capture` runs the controlled target with eight stack frames, renders a hidden window without desktop input, exports allocation, memory-map, stack, allocation-site, and snapshot-growth PNGs beside the executable, and exits after about 24 seconds. It acquires three real snapshots during the run. The target continues until its 28-second workload finishes. `--profile` writes CPU draw-time and frame-time measurements on clean UI exit. `--test-target` opens the ordinary interface against a 180-second fixture.
 
 Third-party license notices and exact source checksums are under `third_party` in the source checkout. The binary package retains license notices under `licenses`. The Win32/DX11 lifecycle adapts Dear ImGui's licensed example.

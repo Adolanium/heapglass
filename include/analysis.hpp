@@ -10,6 +10,8 @@
 #include <vector>
 
 namespace hg {
+struct AllocationProfile;
+struct GrowthReport;
 struct AllocationId {
     uint64_t session{}, heap_generation{}, generation{};
     auto operator<=>(const AllocationId &) const = default;
@@ -103,6 +105,8 @@ struct Model {
     std::vector<Region> regions;
     std::vector<Finding> findings;
     std::vector<Snapshot> snapshots;
+    std::shared_ptr<const AllocationProfile> allocation_profile;
+    std::shared_ptr<const GrowthReport> growth_report;
     std::set<uint64_t> watched;
     uint64_t next_generation = 1, next_heap = 1, unsafe_through = 0, next_capture = 1;
     std::map<uint64_t, uint64_t> capture_owners;

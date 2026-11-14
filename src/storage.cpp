@@ -1,4 +1,5 @@
 #include "analysis.hpp"
+#include "profiling.hpp"
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -461,5 +462,53 @@ void export_csv(const Model &m, const std::wstring &path) {
     }
     if (!f.flush())
         throw std::runtime_error("CSV write failed");
+}
+static std::string stack_text(const AllocationSite &site) {
+    std::string result;
+    for (auto frame : site_frames(site)) {
+        if (!result.empty())
+            result += ';';
+        result += std::to_string(frame);
+    }
+    return result;
+}
+void export_sites_csv(const AllocationProfile &profile, const std::wstring &path) {
+    std::ofstream file{std::filesystem::path(path)};
+    if (!file)
+        throw std::runtime_error("Could not open allocation sites CSV");
+    file << "session,observed_qpc,incomplete,site_source,frames,live_count,live_requested_bytes,"
+            "retained_freed_count,retained_freed_bytes,uncertain_count,uncertain_bytes,unknown_birth_count,"
+            "oldest_known_birth_qpc,bytes_saturated\n";
+    for (const auto &row : profile.groups) {
+        const auto &t = row.totals;
+        file << profile.session << ',' << profile.observed_at << ',' << profile.incomplete << ','
+             << csv_text(site_source(row.site)) << ',' << csv_text(stack_text(row.site)) << ','
+             << t.live_count << ',' << t.live_bytes << ',' << t.freed_count << ',' << t.freed_bytes << ','
+             << t.uncertain_count << ',' << t.uncertain_bytes << ',' << t.unknown_birth_count << ','
+             << t.oldest_known_birth << ',' << t.bytes_saturated << '\n';
+    }
+    if (!file.flush())
+        throw std::runtime_error("Allocation sites CSV write failed");
+}
+void export_growth_csv(const GrowthReport &report, const std::wstring &path) {
+    std::ofstream file{std::filesystem::path(path)};
+    if (!file)
+        throw std::runtime_error("Could not open snapshot growth CSV");
+    file << "session,coverage,first_snapshot,last_snapshot,begin_qpc,end_qpc,observations,site_source,frames,"
+            "before_live_count,after_live_count,before_live_bytes,after_live_bytes,byte_delta,"
+            "before_uncertain_count,after_uncertain_count,survivor_count,survivor_bytes,"
+            "increasing_intervals,sustained_growth,bytes_saturated,uncertain_observations\n";
+    for (const auto &row : report.rows)
+        file << report.session << ',' << csv_text(growth_coverage_name(report.coverage)) << ','
+             << csv_text(report.first_name) << ',' << csv_text(report.last_name) << ',' << report.begin << ','
+             << report.end << ',' << report.observations << ',' << csv_text(site_source(row.site)) << ','
+             << csv_text(stack_text(row.site)) << ',' << row.before.live_count << ',' << row.after.live_count
+             << ',' << row.before.live_bytes << ',' << row.after.live_bytes << ','
+             << csv_text(byte_delta(row.before.live_bytes, row.after.live_bytes)) << ','
+             << row.before.uncertain_count << ',' << row.after.uncertain_count << ',' << row.survivor_count
+             << ',' << row.survivor_bytes << ',' << row.increasing_intervals << ',' << row.sustained_growth
+             << ',' << row.bytes_saturated << ',' << row.uncertain << '\n';
+    if (!file.flush())
+        throw std::runtime_error("Snapshot growth CSV write failed");
 }
 } // namespace hg

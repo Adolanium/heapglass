@@ -73,9 +73,22 @@ void UI::show_allocation_stack() {
 void UI::auto_target() {
     controller.launch(executable_directory() + L"\\HeapglassTarget.exe", L"--duration 180");
 }
+void UI::show_allocation_sites() {
+    investigation_view = InvestigationView::sites;
+}
+void UI::show_snapshot_growth() {
+    investigation_view = InvestigationView::growth;
+}
 void UI::draw() {
-    if (!display_paused || !shown)
-        shown = controller.view();
+    if (!display_paused || !shown) {
+        auto next = controller.view();
+        if (shown && shown->session != next->session) {
+            site_filter.reset();
+            selected = region_selected = 0;
+            inspecting_snapshot = capture_index = -1;
+        }
+        shown = std::move(next);
+    }
     menu();
     const auto *viewport = ImGui::GetMainViewport();
     ImGuiID dock = ImGui::DockSpaceOverViewport(0, viewport, ImGuiDockNodeFlags_PassthruCentralNode);
@@ -135,6 +148,16 @@ void UI::menu() {
             auto p = choose_file(true, L"CSV\0*.csv\0", L"csv");
             if (!p.empty())
                 controller.csv(p);
+        }
+        if (ImGui::MenuItem("Export allocation sites CSV...")) {
+            auto p = choose_file(true, L"CSV\0*.csv\0", L"csv");
+            if (!p.empty())
+                controller.sites_csv(p);
+        }
+        if (ImGui::MenuItem("Export snapshot growth CSV...", nullptr, false, shown->snapshots.size() >= 2)) {
+            auto p = choose_file(true, L"CSV\0*.csv\0", L"csv");
+            if (!p.empty())
+                controller.growth_csv(p);
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Disconnect", nullptr, false, shown->connected))
@@ -291,6 +314,12 @@ void UI::allocation_table() {
     const char *states[] = {"All states", "LIVE", "FREED", "UNCERTAIN"};
     ImGui::SetNextItemWidth(130);
     ImGui::Combo("##state", &state_filter, states, 4);
+    if (site_filter) {
+        ImGui::Text("Site: %s", site_label(*site_filter).c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear site filter"))
+            site_filter.reset();
+    }
     if (ImGui::CollapsingHeader("Address, size, thread, lifetime, entropy & findings")) {
         ImGui::SetNextItemWidth(155);
         ImGui::InputScalar("Address min", ImGuiDataType_U64, &min_address, nullptr, nullptr, "%016llX",
@@ -317,8 +346,9 @@ void UI::allocation_table() {
         ImGui::SetNextItemWidth(210);
         ImGui::InputText("Finding text", finding_filter, sizeof(finding_filter));
     }
-    Filter current{heap_filter,   min_address,  max_address,    min_size, max_size,          state_filter,
-                   thread_filter, min_lifetime, entropy_filter, search,   permission_filter, finding_filter};
+    Filter current{heap_filter,       min_address,    max_address,  min_size,       max_size,
+                   state_filter,      thread_filter,  min_lifetime, entropy_filter, search,
+                   permission_filter, finding_filter, site_filter};
     auto &rows = row_cache;
     if (row_owner != shown || current != row_filter) {
         row_owner = shown;
@@ -331,6 +361,8 @@ void UI::allocation_table() {
                 a.size > max_size || (heap_filter && a.heap != heap_filter) ||
                 (thread_filter > 0 && a.thread != uint32_t(thread_filter)) ||
                 (state_filter && int(a.life) != state_filter - 1))
+                continue;
+            if (site_filter && allocation_site(a) != *site_filter)
                 continue;
             const auto *c = latest(a);
             if (entropy_filter > 0 && (!c || c->entropy < entropy_filter))
@@ -854,9 +886,186 @@ void UI::bottom() {
             }
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Allocation sites", nullptr,
+                                investigation_view == InvestigationView::sites ? ImGuiTabItemFlags_SetSelected
+                                                                               : 0)) {
+            if (investigation_view == InvestigationView::sites)
+                investigation_view = InvestigationView::unchanged;
+            allocation_sites();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(
+                "Snapshot growth", nullptr,
+                investigation_view == InvestigationView::growth ? ImGuiTabItemFlags_SetSelected : 0)) {
+            if (investigation_view == InvestigationView::growth)
+                investigation_view = InvestigationView::unchanged;
+            snapshot_growth();
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
     }
     ImGui::End();
+}
+void UI::site_tooltip(const AllocationSite &site) {
+    if (!ImGui::IsItemHovered())
+        return;
+    ImGui::BeginTooltip();
+    ImGui::TextUnformatted(site_source(site));
+    for (auto address : site_frames(site))
+        ImGui::Text("%s  %s", hex_address(address).c_str(),
+                    shown->offline ? "saved address" : controller.symbol(address).c_str());
+    ImGui::EndTooltip();
+}
+void UI::allocation_sites() {
+    if (!shown->allocation_profile || shown->allocation_profile->groups.empty()) {
+        empty("No allocation sites yet", "Launch or attach to a process, or open a saved session. "
+                                         "Caller-only grouping works with stacks disabled.");
+        return;
+    }
+    const auto &profile = *shown->allocation_profile;
+    const auto &totals = profile.totals;
+    ImGui::Text("Known live: %llu blocks | %s%llu requested bytes | uncertain: %llu blocks",
+                totals.live_count, totals.bytes_saturated ? ">=" : "", totals.live_bytes,
+                totals.uncertain_count);
+    muted(
+        "Retained generations, largest live bytes first. Site = last observed allocation/reallocation call.");
+    if (profile.incomplete)
+        muted("Incomplete history: totals cover retained observations only.");
+    if (ImGui::BeginTable("allocation-sites", 7,
+                          ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg |
+                              ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableSetupColumn("Site", ImGuiTableColumnFlags_WidthFixed, 320);
+        for (const auto *name : {"Live blocks", "Live bytes", "Retained freed", "Uncertain blocks",
+                                 "Uncertain bytes", "Oldest observed age"})
+            ImGui::TableSetupColumn(name, ImGuiTableColumnFlags_WidthFixed, 125);
+        ImGui::TableSetupScrollFreeze(1, 1);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clip;
+        clip.Begin(int(profile.groups.size()));
+        while (clip.Step())
+            for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
+                const auto &row = profile.groups[i];
+                const auto &t = row.totals;
+                ImGui::PushID(i);
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                if (ImGui::Selectable(site_label(row.site).c_str(), false,
+                                      ImGuiSelectableFlags_SpanAllColumns)) {
+                    site_filter = row.site;
+                    regions_view = false;
+                    select_allocation(t.example_generation);
+                    if (std::holds_alternative<StackSite>(row.site))
+                        select_stack_tab = true;
+                }
+                site_tooltip(row.site);
+                ImGui::TableNextColumn();
+                ImGui::Text("%llu", t.live_count);
+                ImGui::TableNextColumn();
+                ImGui::Text("%s%llu", t.bytes_saturated ? ">=" : "", t.live_bytes);
+                ImGui::TableNextColumn();
+                ImGui::Text("%llu", t.freed_count);
+                ImGui::TableNextColumn();
+                ImGui::Text("%llu", t.uncertain_count);
+                ImGui::TableNextColumn();
+                ImGui::Text("%s%llu", t.bytes_saturated ? ">=" : "", t.uncertain_bytes);
+                ImGui::TableNextColumn();
+                if (t.oldest_known_birth && profile.frequency)
+                    ImGui::Text("%.2f s", double(profile.observed_at - t.oldest_known_birth) /
+                                              double(profile.frequency));
+                else
+                    ImGui::TextUnformatted("unknown");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%llu live records have unknown birth. Offline age ends at the latest "
+                                      "retained observation.",
+                                      t.unknown_birth_count);
+                ImGui::PopID();
+            }
+        ImGui::EndTable();
+    }
+}
+void UI::snapshot_growth() {
+    if (!shown->growth_report || shown->growth_report->observations < 2) {
+        empty("Capture at least two named snapshots",
+              "Compare retained live requested bytes by site. Three clean observations can establish "
+              "repeated growth; growth alone does not prove a leak.");
+        return;
+    }
+    const auto &report = *shown->growth_report;
+    const auto repeated = std::count_if(report.rows.begin(), report.rows.end(),
+                                        [](const auto &row) { return row.sustained_growth; });
+    ImGui::Text("%s -> %s | %zu observations | QPC %llu .. %llu", report.first_name.c_str(),
+                report.last_name.c_str(), report.observations, report.begin, report.end);
+    ImGui::TextUnformatted(growth_coverage_name(report.coverage));
+    ImGui::Text("Repeated growth: %zu site%s", size_t(repeated), repeated == 1 ? "" : "s");
+    muted("Growth is an investigation lead, not a confirmed leak. Reallocation can move a record between "
+          "sites.");
+    if (ImGui::BeginTable("snapshot-growth", 10,
+                          ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg |
+                              ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableSetupColumn("Site", ImGuiTableColumnFlags_WidthFixed, 320);
+        ImGui::TableSetupColumn("Byte delta", ImGuiTableColumnFlags_WidthFixed, 95);
+        ImGui::TableSetupColumn("B bytes", ImGuiTableColumnFlags_WidthFixed, 100);
+        ImGui::TableSetupColumn("B blocks", ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableSetupColumn("Evidence", ImGuiTableColumnFlags_WidthFixed, 150);
+        for (const auto *name :
+             {"A bytes", "A blocks", "Present in all", "Survivor bytes", "Increasing intervals"})
+            ImGui::TableSetupColumn(name, ImGuiTableColumnFlags_WidthFixed, 130);
+        ImGui::TableSetupScrollFreeze(1, 1);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clip;
+        clip.Begin(int(report.rows.size()));
+        while (clip.Step())
+            for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
+                const auto &row = report.rows[i];
+                ImGui::PushID(i);
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                if (ImGui::Selectable(site_label(row.site).c_str(), false,
+                                      ImGuiSelectableFlags_SpanAllColumns)) {
+                    const bool final = row.after.example_generation != 0;
+                    select_allocation(final ? row.after.example_generation : row.before.example_generation);
+                    for (size_t s = 0; s < shown->snapshots.size(); ++s)
+                        if ((final && shown->snapshots[s].end == report.end) ||
+                            (!final && shown->snapshots[s].begin == report.begin)) {
+                            inspecting_snapshot = int(s);
+                            break;
+                        }
+                }
+                site_tooltip(row.site);
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(row.bytes_saturated
+                                           ? "overflow: unknown"
+                                           : byte_delta(row.before.live_bytes, row.after.live_bytes).c_str());
+                ImGui::TableNextColumn();
+                ImGui::Text("%s%llu", row.after.bytes_saturated ? ">=" : "", row.after.live_bytes);
+                ImGui::TableNextColumn();
+                ImGui::Text("%llu", row.after.live_count);
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(report.coverage != GrowthCoverage::comparable || row.uncertain
+                                           ? "Uncertain"
+                                       : row.bytes_saturated  ? "Overflow"
+                                       : row.sustained_growth ? "Repeated growth"
+                                                              : "No repeated growth");
+                ImGui::TableNextColumn();
+                ImGui::Text("%s%llu", row.before.bytes_saturated ? ">=" : "", row.before.live_bytes);
+                ImGui::TableNextColumn();
+                ImGui::Text("%llu", row.before.live_count);
+                ImGui::TableNextColumn();
+                if (report.coverage == GrowthCoverage::comparable)
+                    ImGui::Text("%llu", row.survivor_count);
+                else
+                    ImGui::TextUnformatted("unknown");
+                ImGui::TableNextColumn();
+                if (report.coverage == GrowthCoverage::comparable)
+                    ImGui::Text("%s%llu", row.bytes_saturated ? ">=" : "", row.survivor_bytes);
+                else
+                    ImGui::TextUnformatted("unknown");
+                ImGui::TableNextColumn();
+                ImGui::Text("%u / %zu", row.increasing_intervals, report.observations - 1);
+                ImGui::PopID();
+            }
+        ImGui::EndTable();
+    }
 }
 void UI::dialogs() {
     if (show_attach) {

@@ -31,3 +31,9 @@ Limits & rules offers rolling sample retention by default or stop at capacity. T
 Optional stack capture accepts zero through eight frames and is disabled by default. Coverage shows the active frame count and reports native unwinder validation failure. The Inspector's Stack tab lists captured addresses and live symbols, or saved addresses in an offline session, including allocations with no byte samples. It explains when capture is disabled, rejected or unavailable.
 
 UI checks queue keyboard and mouse events through ImGui. Native dialog and synthetic DPI checks run on an unshown private desktop without global desktop input.
+
+## Allocation sites and snapshot growth
+
+The Investigation panel adds Allocation sites and Snapshot growth tabs within the existing dock layout. Both use clipped, resizable tables with frozen site columns and headers. Site groups sort by live requested bytes. Selecting a group filters the central allocation table and opens an example in the Inspector; a visible Clear site filter action restores other records.
+
+Growth places byte delta, final bytes, final block count and evidence before the horizontally scrolled details. The summary keeps coverage and the number of repeated-growth sites visible. Text distinguishes uncertain observations, overflow and repeated growth. These reports use the existing body font, table styling and state colors. Group identities use saved addresses; symbol details appear on hover when available.
