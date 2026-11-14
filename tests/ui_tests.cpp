@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <stdexcept>
@@ -188,6 +189,13 @@ hg::Model offline_fixture() {
         a.size = sizes[i];
         a.born = 10;
         a.thread = 7;
+        a.caller = i == 1 ? 0x77770002 : 0x77770001;
+        if (i != 1) {
+            a.stack_count = 2;
+            a.stack_status = 1;
+            a.stack[0] = 0x77770001;
+            a.stack[1] = 0x88880001;
+        }
         a.history.push_back({10, a.size, a.address});
         model.records.emplace(i + 1, a);
         capture(model, i + 1, 100, strings[i]);
@@ -234,6 +242,14 @@ void exercise_ui() {
     h.contains("OFFLINE");
     h.contains("OFFLINE UI FIXTURE.exe");
     h.contains("3 / 3 records");
+    h.app.show_allocation_sites();
+    for (int i = 0; i < 3; ++i)
+        h.frame();
+    h.contains("Known live: 3 blocks | 1280 requested bytes | uncertain: 0 blocks");
+    h.app.show_snapshot_growth();
+    for (int i = 0; i < 3; ++i)
+        h.frame();
+    h.contains("Comparable retained observations");
     require(h.allocation_rows() ==
                 std::vector<std::string>{"0000000000001000", "0000000000002000", "0000000000003000"},
             "Initial visible allocation order differs");
@@ -262,6 +278,19 @@ void exercise_ui() {
     h.click("Allocations & memory map", "0000000000002000");
     h.contains("0000000000002000 | 128 bytes | LIVE");
     h.contains("Heap generation 1 | allocation 2");
+    h.click("Investigation", "Allocation sites");
+    h.contains("Known live: 3 blocks | 1280 requested bytes | uncertain: 0 blocks");
+    h.click("Investigation", "0000000077770001 | bounded stack (2 frames)");
+    h.contains("0000000000001000 | 768 bytes | LIVE");
+    h.contains("saved address");
+    h.contains("2 / 3 records");
+    h.click("Allocations & memory map", "Clear site filter");
+    h.contains("3 / 3 records");
+    h.click("Investigation", "Snapshot growth");
+    h.contains("Offline before -> Offline after | 2 observations");
+    h.contains("Comparable retained observations");
+    h.click("Investigation", "0000000077770001 | bounded stack (2 frames)");
+    h.contains("Snapshot: Offline after | acquired QPC 200 .. 210");
     h.click("Investigation", "All strings");
     // The first allocation's first string is historical, so this must select capture zero.
     h.click("Investigation", "0000000000001000");
@@ -324,6 +353,14 @@ void exercise_ui() {
     allocation.stack_count = 1;
     allocation.stack_status = 1;
     allocation.stack[0] = 0x12345678;
+    unsampled.snapshots[0].records[0].size = 256;
+    unsampled.snapshots[1].records[0].size = 512;
+    auto third = unsampled.snapshots.back();
+    third.name = "Offline final";
+    third.begin = 300;
+    third.end = 310;
+    third.records[0].size = 768;
+    unsampled.snapshots.push_back(std::move(third));
     hg::save_session(unsampled, fixture.path.wstring(), true);
     const auto previous_view = h.app.controller.view();
     h.app.controller.load(fixture.path.wstring());
@@ -340,6 +377,34 @@ void exercise_ui() {
     h.contains("saved address");
     h.click("Inspector", "History");
     h.contains("QPC 10 |");
+    h.click("Investigation", "Snapshot growth");
+    h.contains("Offline before -> Offline final | 3 observations");
+    h.contains("Repeated growth: 1 site");
+    h.app.controller.growth_csv(fixture.path.wstring() + L".growth.csv");
+    const auto export_deadline = GetTickCount64() + 5000;
+    while (h.app.controller.view()->status != "Snapshot growth exported" &&
+           GetTickCount64() < export_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    require(h.app.controller.view()->status == "Snapshot growth exported", "Growth CSV job did not complete");
+    std::ifstream growth_file(fixture.path.wstring() + L".growth.csv");
+    const std::string growth_text((std::istreambuf_iterator<char>(growth_file)), {});
+    growth_file.close();
+    std::filesystem::remove(fixture.path.wstring() + L".growth.csv");
+    require(growth_text.find("before_live_count,after_live_count") != std::string::npos,
+            "Growth CSV did not contain snapshot totals");
+    h.app.controller.sites_csv(fixture.path.wstring() + L".sites.csv");
+    const auto sites_deadline = GetTickCount64() + 5000;
+    while (h.app.controller.view()->status != "Allocation sites exported" &&
+           GetTickCount64() < sites_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    require(h.app.controller.view()->status == "Allocation sites exported", "Site CSV job did not complete");
+    std::ifstream sites_file(fixture.path.wstring() + L".sites.csv");
+    const std::string sites_text((std::istreambuf_iterator<char>(sites_file)), {});
+    sites_file.close();
+    std::filesystem::remove(fixture.path.wstring() + L".sites.csv");
+    require(sites_text.find("live_requested_bytes") != std::string::npos &&
+                sites_text.find("caller only") != std::string::npos,
+            "Sites CSV did not preserve caller-only grouping");
 }
 } // namespace
 

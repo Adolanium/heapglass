@@ -1,4 +1,5 @@
 #include "controller.hpp"
+#include "profiling.hpp"
 #include <algorithm>
 #include <array>
 #include <bcrypt.h>
@@ -205,6 +206,7 @@ void Controller::take_snapshot(std::string name) {
             }
         }
         model.snapshots.push_back(std::move(s));
+        growth_cache.reset();
         if (model.snapshots.size() > 4)
             model.snapshots.erase(model.snapshots.begin());
     });
@@ -244,6 +246,7 @@ void Controller::load(std::wstring path) {
         auto loaded = load_session(path);
         close();
         model = std::move(loaded);
+        growth_cache.reset();
         model.status = "Offline session; no process reads";
     });
 }
@@ -251,6 +254,18 @@ void Controller::csv(std::wstring path) {
     enqueue([this, path = std::move(path)] {
         export_csv(model, path);
         model.status = "CSV exported";
+    });
+}
+void Controller::sites_csv(std::wstring path) {
+    enqueue([this, path = std::move(path)] {
+        export_sites_csv(summarize_allocations(model, ticks()), path);
+        model.status = "Allocation sites exported";
+    });
+}
+void Controller::growth_csv(std::wstring path) {
+    enqueue([this, path = std::move(path)] {
+        export_growth_csv(analyze_growth(model.snapshots), path);
+        model.status = "Snapshot growth exported";
     });
 }
 void Controller::stall_ingestion(unsigned ms) {
@@ -318,7 +333,13 @@ void Controller::publish() {
     model.controller_dropped = local_dropped.load();
     model.analysis_pending = pending_write.load() - pending_read.load();
     model.transport_pending = shared ? uint64_t(atomic_read(&shared->write) - atomic_read(&shared->read)) : 0;
-    published.store(std::make_shared<const Model>(model.presentation()));
+    auto presentation = model.presentation();
+    presentation.allocation_profile =
+        std::make_shared<const AllocationProfile>(summarize_allocations(model, ticks()));
+    if (!growth_cache)
+        growth_cache = std::make_shared<const GrowthReport>(analyze_growth(model.snapshots));
+    presentation.growth_report = growth_cache;
+    published.store(std::make_shared<const Model>(std::move(presentation)));
     publish_ticks.fetch_add(ticks() - begin, std::memory_order_relaxed);
     last_publish = GetTickCount64();
     dirty = false;
@@ -469,6 +490,7 @@ void Controller::connect(DWORD pid) {
         throw std::runtime_error("Self instrumentation is unsupported");
     close();
     model = Model{};
+    growth_cache.reset();
     model.limits = desired_limits;
     pending_read = 0;
     pending_write = 0;

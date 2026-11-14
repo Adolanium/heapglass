@@ -108,7 +108,7 @@
         {
           "name": "Investigation",
           "position": "below the center panel",
-          "tabs": ["Events", "All strings", "Findings", "Compare snapshots"]
+          "tabs": ["Events", "All strings", "Findings", "Compare snapshots", "Allocation sites", "Snapshot growth"]
         }
       ],
       "tableBehavior": "Allocation and region tables clip rows, scroll horizontally and vertically, and freeze their first column and header row."

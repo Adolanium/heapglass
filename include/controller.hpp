@@ -38,6 +38,8 @@ class Controller {
     void save(std::wstring path, bool bytes);
     void load(std::wstring path);
     void csv(std::wstring path);
+    void sites_csv(std::wstring path);
+    void growth_csv(std::wstring path);
     void sample_now();
     std::shared_ptr<const Model> view() const {
         return published.load();
@@ -64,6 +66,7 @@ class Controller {
     std::map<uint64_t, std::string> symbols;
     Model model;
     Limits desired_limits;
+    std::shared_ptr<const GrowthReport> growth_cache;
     HANDLE process_handle = nullptr, map_handle = nullptr, lease = nullptr;
     Shared *shared = nullptr;
     uint64_t last_sample = 0, last_region = 0, last_publish = 0, cursor = 0;

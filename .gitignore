@@ -10,4 +10,6 @@ Heapglass.ini
 Heapglass.allocations.png
 Heapglass.memory-map.png
 Heapglass.stack.png
+Heapglass.sites.png
+Heapglass.growth.png
 capture-error.txt

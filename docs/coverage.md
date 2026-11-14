@@ -58,6 +58,8 @@ Rules report high entropy, large byte or entropy changes, repeated sampled trans
 
 ## Resource limits
 
+Allocation-site summaries run on the analysis worker during presentation publication and share immutable results with the interface. Snapshot-growth reports are cached until the snapshot set or session changes. They group retained generations by the last observed allocation/reallocation stack or caller, keep uncertain totals separate, and require three clean increasing observations for a repeated-growth lead. They do not establish a leak or a pre-attach baseline. See [profiling semantics](profiling.md).
+
 Defaults are 4 KiB per allocation, 1 MiB per scan, 32 MiB of live retained bytes, a one-second sample interval, and four-character strings. Selected watched allocations take priority over the round-robin scan. Repeatedly changing the watch list can reduce coverage of other allocations.
 
 Retention caps are 50,000 allocation records, 50,000 heap entries, 10,000 events, eight captures and 64 size-history entries per allocation, and four snapshots with at most 8 MiB of bytes each. These limits bound data, not the exact resident set; queues, parsed JSON, strings, snapshots, and graphics have additional memory cost. Rolling mode evicts the oldest captures across allocations to make space. Stop-at-capacity mode skips new samples at the byte limit. Both modes retain the per-allocation history cap. Lowering a budget trims retained captures immediately. The session panel exposes retained bytes, evictions, skipped samples, exhausted capacity, and queue losses and backlogs.
