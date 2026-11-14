@@ -80,8 +80,8 @@ J run(bool instrumented, unsigned seconds) {
         controller.launch(exe, arguments);
         auto m = await(controller, [](const Model &v) { return v.connected; });
         target.pid = m->pid;
-        target.process =
-            OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE, FALSE, target.pid);
+        target.process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE,
+                                     FALSE, target.pid);
         CHECK(target.process);
         controller.schedule_snapshots(seconds >= 60 ? 10000 : 1300);
         m = await(controller,
@@ -298,7 +298,8 @@ void stopped_baseline() {
                       L"--sustained --duration 3 --growth-ms 500");
     auto m = await(controller, [](const Model &v) { return v.connected && v.observed > 100; });
     target.pid = m->pid;
-    target.process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target.pid);
+    target.process =
+        OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, target.pid);
     CHECK(target.process);
     struct Mapping {
         HANDLE handle = nullptr;
