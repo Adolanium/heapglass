@@ -11,6 +11,10 @@ These references informed the implementation. The Rtl declarations are verified 
 - [VirtualQueryEx](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualqueryex) and [ReadProcessMemory](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-readprocessmemory): page query, protection, readable spans, and partial reads.
 - [GetProcessHeaps](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-getprocessheaps) and [HeapWalk](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapwalk): these operate on the calling process. Heapglass does not use them against a remote process.
 - [DLL lifecycle guidance](https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-best-practices): loader-lock constraints. Initialization is an explicit exported function called outside DllMain.
+- [RtlCaptureStackBackTrace](https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtlcapturestackbacktrace): bounded native stack capture. The user-mode signature returns USHORT and accepts ULONG skip/count arguments, PVOID frame storage, and an optional PULONG hash.
+- [CreateWaitableTimerExW](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createwaitabletimerexw): private high-resolution collector timer.
+- [GetStringTypeW](https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-getstringtypew): BMP character classification. Supplementary scalar acceptance remains explicitly bounded in the extractor.
+- [CreateDesktopW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createdesktopw) and [SetThreadDesktop](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setthreaddesktop): isolated native-dialog validation without switching the user's input desktop.
 - [Entropy classification limitations](https://arxiv.org/abs/2010.07754): compression and encryption can both produce high-entropy observations.
 
 ## User-mode ABI check

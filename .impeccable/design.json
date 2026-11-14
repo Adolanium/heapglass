@@ -8,6 +8,7 @@
       "interface": "Dear ImGui docking",
       "renderer": "Direct3D 11",
       "keyboardNavigation": true,
+      "wideCharacterDefinition": "IMGUI_USE_WCHAR32, enabled globally in CMake",
       "layoutPersistence": "%LOCALAPPDATA%/Heapglass/layout.ini"
     },
     "colors": {
@@ -35,7 +36,26 @@
         "family": "Segoe UI",
         "file": "%WINDIR%/Fonts/segoeui.ttf",
         "logicalPixelSize": 15,
-        "usage": "Menus, panel titles, controls, tables and evidence text"
+        "usage": "Menus, panel titles, controls, tables and evidence text",
+        "requestedGlyphRanges": ["U+0020..U+024F", "U+0370..U+06FF", "U+2000..U+206F", "U+4E00..U+9FFF"],
+        "coverage": "Latin, Greek, Cyrillic, Hebrew, Arabic, general punctuation and CJK ideographs, subject to installed font glyph availability",
+        "optionalMerges": [
+          {
+            "purpose": "CJK glyphs",
+            "selection": "First existing file in the installed Windows Fonts directory",
+            "orderedFiles": ["msyh.ttc", "YuGothR.ttc", "malgun.ttf", "simsun.ttc"],
+            "requestedGlyphRanges": ["U+2E80..U+9FFF"],
+            "logicalPixelSize": 15
+          },
+          {
+            "purpose": "Emoji glyphs",
+            "family": "Segoe UI Emoji",
+            "file": "%WINDIR%/Fonts/seguiemj.ttf",
+            "selection": "Merge only when the installed file exists",
+            "requestedGlyphRanges": ["U+1F600..U+1F6C5"],
+            "logicalPixelSize": 15
+          }
+        ]
       },
       "hex": {
         "family": "Consolas",
@@ -72,7 +92,7 @@
         {
           "name": "Session & navigation",
           "position": "left",
-          "contents": "Process identity, coverage, snapshots, allocation and memory-map navigation, status"
+          "contents": "Process identity, coverage, retention and collector indicators, stack capture status, snapshots, allocation and memory-map navigation, status"
         },
         {
           "name": "Allocations & memory map",
@@ -82,7 +102,8 @@
         {
           "name": "Inspector",
           "position": "right",
-          "contents": "Selected allocation identity and sampled content, or selected memory region and evidence"
+          "contents": "Selected allocation identity and sampled content, or selected memory region and evidence",
+          "allocationTabs": ["Hex + ASCII", "Strings", "Stack", "History", "Findings"]
         },
         {
           "name": "Investigation",
@@ -91,6 +112,34 @@
         }
       ],
       "tableBehavior": "Allocation and region tables clip rows, scroll horizontally and vertically, and freeze their first column and header row."
+    },
+    "capacityControls": {
+      "location": "Sampling limits & rules modal",
+      "retention": {
+        "label": "Retention policy",
+        "choices": ["Rolling oldest samples", "Stop at capacity"],
+        "default": "Rolling oldest samples"
+      },
+      "coverageIndicators": ["Collector losses", "Queued target", "Queued analysis", "Retained", "Sample evictions", "Skipped samples"],
+      "retentionIndicators": ["Rolling sample retention", "Stop at byte capacity"],
+      "budgetExhaustedMessage": "SAMPLING STOPPED: byte budget exhausted. Increase the limit or choose rolling retention."
+    },
+    "stackControls": {
+      "location": "Sampling limits & rules modal",
+      "label": "Optional stack frames",
+      "minimum": 0,
+      "maximum": 8,
+      "default": 0,
+      "requirement": "The target agent's allocation-free native unwinder probe must pass before capture is enabled.",
+      "coverage": "Active frame count out of eight, with an explicit unavailable message when native unwinder validation fails",
+      "inspectorTab": "Stack",
+      "frameDisplay": "Frame index, address and live symbol, or saved address for an offline session",
+      "emptyState": "Explains disabled capture or rejected and failed native capture"
+    },
+    "interactionValidation": {
+      "desktopUI": "Real ImGui queued keyboard and mouse input",
+      "nativeDialogsAndDpi": "Native common dialogs and synthetic WM_DPICHANGED messages on an unshown private desktop",
+      "globalDesktopInput": false
     }
   },
   "components": [

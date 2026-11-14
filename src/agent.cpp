@@ -4,6 +4,8 @@
 #include <tlhelp32.h>
 
 namespace {
+using Backtrace = USHORT(WINAPI *)(ULONG, ULONG, PVOID *, PULONG);
+Backtrace real_backtrace = nullptr;
 using Alloc = PVOID(NTAPI *)(PVOID, ULONG, SIZE_T);
 using Realloc = PVOID(NTAPI *)(PVOID, ULONG, PVOID, SIZE_T);
 // Windows 8+ user-mode RtlFreeHeap returns LOGICAL (ULONG), not the kernel BOOLEAN declaration.
@@ -23,6 +25,17 @@ void set_depth(bool active) noexcept {
 }
 volatile LONG initialized = 0;
 bool collecting() noexcept {
+    if (shared && depth_index != TLS_OUT_OF_INDEXES) {
+        auto guard = reinterpret_cast<uintptr_t>(TlsGetValue(depth_index));
+        if (guard) {
+            if (guard >= 2) {
+                InterlockedIncrement64(&shared->stack_violations);
+                if (guard == 3)
+                    hg::dropped(shared);
+            }
+            return false;
+        }
+    }
     if (!shared || hg::atomic_read(&shared->ready) != 1 || hg::atomic_read(&shared->disconnected) ||
         !hg::atomic_read(&shared->recording))
         return false;
@@ -31,7 +44,7 @@ bool collecting() noexcept {
             InterlockedIncrement64(&shared->epoch);
         return false;
     }
-    return !TlsGetValue(depth_index);
+    return true;
 }
 struct Pending {
     hg::Event event;
@@ -39,7 +52,6 @@ struct Pending {
 };
 Pending begin(hg::Op op, void *heap, void *previous, SIZE_T size, ULONG flags, void *caller) noexcept {
     set_depth(true);
-    InterlockedIncrement64(&shared->active);
     hg::Event e{};
     e.begin = InterlockedIncrement64(&shared->clock);
     e.op = op;
@@ -49,7 +61,10 @@ Pending begin(hg::Op op, void *heap, void *previous, SIZE_T size, ULONG flags, v
     e.thread = GetCurrentThreadId();
     e.flags = flags;
     e.caller = reinterpret_cast<uint64_t>(caller);
-    return {e, hg::reserve(shared)};
+    auto reservation = hg::reserve(shared);
+    if (!reservation.slot)
+        InterlockedIncrement64(&shared->unbuffered_active);
+    return {e, reservation};
 }
 void finish(Pending &pending, uint64_t result, bool abnormal) noexcept {
     DWORD error = GetLastError();
@@ -58,15 +73,46 @@ void finish(Pending &pending, uint64_t result, bool abnormal) noexcept {
     e.address = e.op == hg::Op::free ? e.previous : e.op == hg::Op::destroy_heap ? e.heap : result;
     if (e.op == hg::Op::create_heap)
         e.heap = result;
-    e.end = InterlockedIncrement64(&shared->clock);
     e.ticks = hg::ticks();
     if (abnormal)
         e.reserved = 1;
+    auto count = hg::atomic_read(&shared->stack_frames);
+    if (count > 0 && count <= hg::max_stack_frames && hg::atomic_read(&shared->stack_ready) == 1) {
+        auto before = hg::atomic_read(&shared->stack_violations);
+        TlsSetValue(depth_index, reinterpret_cast<void *>(3));
+#if defined(HG_VALIDATE_UNSAFE_TRACE)
+        auto unexpected = HeapAlloc(GetProcessHeap(), 0, 32);
+        HeapFree(GetProcessHeap(), 0, unexpected);
+#endif
+        __try {
+            PVOID frames[hg::max_stack_frames]{};
+            e.stack_count = real_backtrace(2, static_cast<ULONG>(count), frames, nullptr);
+            if (e.stack_count > static_cast<unsigned>(count))
+                e.stack_count = 0;
+            for (unsigned i = 0; i < e.stack_count; ++i)
+                e.stack[i] = reinterpret_cast<uint64_t>(frames[i]);
+            e.stack_status = e.stack_count ? 1 : 2;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            e.stack_count = 0;
+            e.stack_status = 2;
+            InterlockedExchange(&shared->stack_ready, -1);
+        }
+        if (hg::atomic_read(&shared->stack_violations) != before) {
+            e.stack_count = 0;
+            e.stack_status = 2;
+            e.reserved |= 2;
+            InterlockedExchange(&shared->stack_ready, -1);
+            InterlockedExchange(&shared->stack_frames, 0);
+        }
+        set_depth(true);
+    }
+    e.end = InterlockedIncrement64(&shared->clock);
     if (pending.reservation.slot)
         hg::publish(pending.reservation, e);
     else
         hg::dropped(shared);
-    InterlockedDecrement64(&shared->active);
+    if (!pending.reservation.slot)
+        InterlockedDecrement64(&shared->unbuffered_active);
     set_depth(false);
     SetLastError(error);
 }
@@ -153,6 +199,11 @@ PVOID NTAPI hook_destroy(PVOID heap) {
 }
 LONG install() {
     HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    real_backtrace = reinterpret_cast<Backtrace>(GetProcAddress(nt, "RtlCaptureStackBackTrace"));
+    if (real_backtrace) {
+        PVOID warm[hg::max_stack_frames]{};
+        real_backtrace(0, hg::max_stack_frames, warm, nullptr);
+    }
     real_alloc = reinterpret_cast<Alloc>(GetProcAddress(nt, "RtlAllocateHeap"));
     real_realloc = reinterpret_cast<Realloc>(GetProcAddress(nt, "RtlReAllocateHeap"));
     real_free = reinterpret_cast<Free>(GetProcAddress(nt, "RtlFreeHeap"));
@@ -245,6 +296,10 @@ LONG install() {
             error = DetourAttach(reinterpret_cast<PVOID *>(&real_realloc), hook_realloc);
         if (!error)
             error = DetourAttach(reinterpret_cast<PVOID *>(&real_free), hook_free);
+#if defined(HG_VALIDATE_INSTALL_FAILURE)
+        if (!error)
+            error = ERROR_CANCELLED;
+#endif
         if (!error)
             error = DetourAttach(reinterpret_cast<PVOID *>(&real_create), hook_create);
         if (!error)
@@ -259,6 +314,9 @@ LONG install() {
     return error;
 }
 } // namespace
+extern "C" __declspec(dllexport) DWORD WINAPI HeapglassProtocolVersion(LPVOID) {
+    return hg::protocol_version;
+}
 extern "C" __declspec(dllexport) DWORD WINAPI HeapglassInitialize(LPVOID) {
     if (InterlockedCompareExchange(&initialized, 1, 0))
         return shared && hg::atomic_read(&shared->ready) == 1 ? ERROR_SUCCESS : ERROR_ALREADY_INITIALIZED;
@@ -302,6 +360,19 @@ extern "C" __declspec(dllexport) DWORD WINAPI HeapglassInitialize(LPVOID) {
     LONG error = install();
     InterlockedExchange(&shared->error, error);
     InterlockedExchange(&shared->ready, error ? -1 : 1);
+    if (!error && real_backtrace) {
+        auto before = hg::atomic_read(&shared->stack_violations);
+        bool good = true;
+        TlsSetValue(depth_index, reinterpret_cast<void *>(2));
+        for (unsigned i = 0; i < 32; ++i) {
+            PVOID frames[hg::max_stack_frames]{};
+            if (!real_backtrace(0, hg::max_stack_frames, frames, nullptr))
+                good = false;
+        }
+        set_depth(true);
+        InterlockedExchange(&shared->stack_ready,
+                            good && before == hg::atomic_read(&shared->stack_violations) ? 1 : -1);
+    }
     if (error) {
         UnmapViewOfFile(shared);
         shared = nullptr;

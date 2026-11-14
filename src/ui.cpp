@@ -1,4 +1,5 @@
 #include "ui.hpp"
+#include "desktop.hpp"
 #include <algorithm>
 #include <cfloat>
 #include <commdlg.h>
@@ -15,18 +16,6 @@ static std::string hex_address(uint64_t n) {
 }
 static std::string basename(const std::string &s) {
     return narrow(std::filesystem::path(widen(s)).filename().wstring());
-}
-static std::wstring file_dialog(bool save, const wchar_t *filter, const wchar_t *extension) {
-    wchar_t b[32768]{};
-    OPENFILENAMEW o{};
-    o.lStructSize = sizeof(o);
-    o.hwndOwner = GetActiveWindow();
-    o.lpstrFilter = filter;
-    o.lpstrFile = b;
-    o.nMaxFile = 32768;
-    o.lpstrDefExt = extension;
-    o.Flags = OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
-    return (save ? GetSaveFileNameW(&o) : GetOpenFileNameW(&o)) ? b : L"";
 }
 static void muted(const char *s) {
     ImGui::TextColored(ImVec4(.60f, .68f, .73f, 1), "%s", s);
@@ -54,12 +43,30 @@ static size_t acquired(const Snapshot &s) {
 static double age(const Allocation &a, const Model &m) {
     return a.birth_known && a.died && m.frequency ? double(a.died - a.born) / double(m.frequency) : -1;
 }
+std::wstring UI::choose_file(bool save, const wchar_t *filter, const wchar_t *extension) {
+    try {
+        return hg::file_dialog(save, filter, extension);
+    } catch (const std::exception &e) {
+        ui_error = e.what();
+        return {};
+    }
+}
 void UI::show_memory_map() {
     regions_view = true;
     selected = 0;
     for (const auto &r : shown->regions)
         if (r.type == MEM_PRIVATE && (r.protection & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
             region_selected = r.base;
+            break;
+        }
+}
+void UI::show_allocation_stack() {
+    region_selected = 0;
+    regions_view = false;
+    select_stack_tab = true;
+    for (const auto &[id, a] : shown->records)
+        if (a.life == Life::live && a.stack_count) {
+            selected = id;
             break;
         }
 }
@@ -89,7 +96,7 @@ void UI::draw() {
     if (!selected && !region_selected && shown->recording)
         for (const auto &[id, a] : shown->records) {
             if (auto c = latest(a);
-                c && !c->strings.empty() && c->strings[0].value.starts_with("Heapglass")) {
+                c && !c->strings().empty() && c->strings()[0].value.starts_with("Heapglass")) {
                 selected = id;
                 break;
             }
@@ -114,18 +121,18 @@ void UI::menu() {
             auto_target();
         ImGui::Separator();
         if (ImGui::MenuItem("Open saved session...")) {
-            auto p = file_dialog(false, L"Heapglass session\0*.json\0All files\0*.*\0", L"json");
+            auto p = choose_file(false, L"Heapglass session\0*.json\0All files\0*.*\0", L"json");
             if (!p.empty())
                 controller.load(p);
         }
         ImGui::MenuItem("Include sampled bytes in JSON", nullptr, &include_bytes);
         if (ImGui::MenuItem("Save session / export JSON...")) {
-            auto p = file_dialog(true, L"Heapglass session\0*.json\0", L"json");
+            auto p = choose_file(true, L"Heapglass session\0*.json\0", L"json");
             if (!p.empty())
                 controller.save(p, include_bytes);
         }
         if (ImGui::MenuItem("Export allocation CSV...")) {
-            auto p = file_dialog(true, L"CSV\0*.csv\0", L"csv");
+            auto p = choose_file(true, L"CSV\0*.csv\0", L"csv");
             if (!p.empty())
                 controller.csv(p);
         }
@@ -175,11 +182,24 @@ void UI::sidebar() {
         ImGui::Text("Events: %llu", shown->observed);
         ImGui::Text("Lost: %llu", shown->dropped);
         ImGui::Text("Evicted records: %llu", shown->evicted);
+        ImGui::Text("Collector losses: %llu", shown->controller_dropped);
+        ImGui::Text("Queued target: %llu", shown->transport_pending);
+        ImGui::Text("Queued analysis: %llu", shown->analysis_pending);
         ImGui::TextColored(shown->incomplete ? ImVec4(1, .74f, .37f, 1) : ImVec4(.44f, .84f, .8f, 1), "%s",
                            shown->incomplete ? "INCOMPLETE HISTORY" : "No reported event loss");
         ImGui::Text("Sample: %u ms / %zu bytes", shown->limits.sample_ms, shown->limits.per_allocation);
         ImGui::Text("Retained: %.1f / %.0f MiB", double(shown->retained_bytes) / 1048576.,
                     double(shown->limits.per_session) / 1048576.);
+        ImGui::Text("Sample evictions: %llu", shown->evicted_captures);
+        ImGui::Text("Skipped samples: %llu", shown->skipped_captures);
+        muted(shown->limits.retention == Retention::rolling ? "Rolling sample retention"
+                                                            : "Stop at byte capacity");
+        if (shown->sampling_budget_exhausted)
+            ImGui::TextWrapped(
+                "SAMPLING STOPPED: byte budget exhausted. Increase the limit or choose rolling retention.");
+        ImGui::Text("Stack capture: %u / %u frames", shown->active_stack_frames, max_stack_frames);
+        if (shown->stack_state == 2)
+            ImGui::TextWrapped("Stack capture unavailable: native unwinder validation failed.");
         heading("Snapshots");
         ImGui::SetNextItemWidth(-1);
         ImGui::InputText("##snapshot-name", snapshot_name, sizeof(snapshot_name));
@@ -297,44 +317,53 @@ void UI::allocation_table() {
         ImGui::SetNextItemWidth(210);
         ImGui::InputText("Finding text", finding_filter, sizeof(finding_filter));
     }
-    std::vector<const Allocation *> rows;
-    rows.reserve(shown->records.size());
-    for (const auto &[_, a] : shown->records) {
-        if (a.address < min_address || a.address > max_address || a.size < min_size || a.size > max_size ||
-            (heap_filter && a.heap != heap_filter) ||
-            (thread_filter > 0 && a.thread != uint32_t(thread_filter)) ||
-            (state_filter && int(a.life) != state_filter - 1))
-            continue;
-        const auto *c = latest(a);
-        if (entropy_filter > 0 && (!c || c->entropy < entropy_filter))
-            continue;
-        if (min_lifetime > 0 && (age(a, *shown) < double(min_lifetime) / 1000.))
-            continue;
-        if (*permission_filter &&
-            (!c || protection_name(c->protection).find(permission_filter) == std::string::npos))
-            continue;
-        if (*search) {
-            bool match = false;
-            if (c)
-                for (const auto &s : c->strings)
-                    if (s.value.find(search) != std::string::npos) {
+    Filter current{heap_filter,   min_address,  max_address,    min_size, max_size,          state_filter,
+                   thread_filter, min_lifetime, entropy_filter, search,   permission_filter, finding_filter};
+    auto &rows = row_cache;
+    if (row_owner != shown || current != row_filter) {
+        row_owner = shown;
+        row_filter = current;
+        rows.clear();
+        sorted_column = -1;
+        rows.reserve(shown->records.size());
+        for (const auto &[_, a] : shown->records) {
+            if (a.address < min_address || a.address > max_address || a.size < min_size ||
+                a.size > max_size || (heap_filter && a.heap != heap_filter) ||
+                (thread_filter > 0 && a.thread != uint32_t(thread_filter)) ||
+                (state_filter && int(a.life) != state_filter - 1))
+                continue;
+            const auto *c = latest(a);
+            if (entropy_filter > 0 && (!c || c->entropy < entropy_filter))
+                continue;
+            if (min_lifetime > 0 && (age(a, *shown) < double(min_lifetime) / 1000.))
+                continue;
+            if (*permission_filter &&
+                (!c || protection_name(c->protection).find(permission_filter) == std::string::npos))
+                continue;
+            if (*search) {
+                bool match = false;
+                if (c)
+                    for (const auto &s : c->strings())
+                        if (s.value.find(search) != std::string::npos) {
+                            match = true;
+                            break;
+                        }
+                if (!match)
+                    continue;
+            }
+            if (*finding_filter) {
+                bool match = false;
+                for (const auto &f : shown->findings)
+                    if (f.generation == a.id.generation &&
+                        f.title.find(finding_filter) != std::string::npos) {
                         match = true;
                         break;
                     }
-            if (!match)
-                continue;
+                if (!match)
+                    continue;
+            }
+            rows.push_back(&a);
         }
-        if (*finding_filter) {
-            bool match = false;
-            for (const auto &f : shown->findings)
-                if (f.generation == a.id.generation && f.title.find(finding_filter) != std::string::npos) {
-                    match = true;
-                    break;
-                }
-            if (!match)
-                continue;
-        }
-        rows.push_back(&a);
     }
     ImGui::Text("%zu / %zu records | event metadata + sampled content", rows.size(), shown->records.size());
     if (rows.empty())
@@ -355,51 +384,57 @@ void UI::allocation_table() {
         int column = spec && spec->SpecsCount ? spec->Specs[0].ColumnUserID : 0;
         bool ascending =
             !spec || !spec->SpecsCount || spec->Specs[0].SortDirection != ImGuiSortDirection_Descending;
-        std::sort(rows.begin(), rows.end(), [&](const Allocation *a, const Allocation *b) {
-            auto cmp = [](const auto &x, const auto &y) { return x < y ? -1 : x > y ? 1 : 0; };
-            auto ca = latest(*a), cb = latest(*b);
-            int order = 0;
-            switch (column) {
-            case 0:
-                order = cmp(a->address, b->address);
-                break;
-            case 1:
-                order = cmp(a->size, b->size);
-                break;
-            case 2:
-                order = cmp(a->heap, b->heap);
-                break;
-            case 3:
-                order = cmp(a->life, b->life);
-                break;
-            case 4:
-                order = cmp(ca ? ca->entropy : -1., cb ? cb->entropy : -1.);
-                break;
-            case 5:
-                order = cmp(ca ? protection_name(ca->protection) : "unknown",
-                            cb ? protection_name(cb->protection) : "unknown");
-                break;
-            case 6:
-                order = cmp(age(*a, *shown), age(*b, *shown));
-                break;
-            case 7:
-                order = cmp(a->caller, b->caller);
-                break;
-            case 8:
-                order = cmp(ca && !ca->strings.empty() ? ca->strings[0].value : "",
-                            cb && !cb->strings.empty() ? cb->strings[0].value : "");
-                break;
-            case 9:
-                order = cmp(a->thread, b->thread);
-                break;
-            case 10:
-                order = cmp(a->id.generation, b->id.generation);
-                break;
-            }
-            if (!order)
-                order = cmp(a->id.generation, b->id.generation);
-            return ascending ? order < 0 : order > 0;
-        });
+        if (sorted_column != column || sorted_ascending != ascending) {
+            std::sort(rows.begin(), rows.end(), [&](const Allocation *a, const Allocation *b) {
+                auto cmp = [](const auto &x, const auto &y) { return x < y ? -1 : x > y ? 1 : 0; };
+                auto ca = latest(*a), cb = latest(*b);
+                int order = 0;
+                switch (column) {
+                case 0:
+                    order = cmp(a->address, b->address);
+                    break;
+                case 1:
+                    order = cmp(a->size, b->size);
+                    break;
+                case 2:
+                    order = cmp(a->heap, b->heap);
+                    break;
+                case 3:
+                    order = cmp(a->life, b->life);
+                    break;
+                case 4:
+                    order = cmp(ca ? ca->entropy : -1., cb ? cb->entropy : -1.);
+                    break;
+                case 5:
+                    order = cmp(ca ? protection_name(ca->protection) : "unknown",
+                                cb ? protection_name(cb->protection) : "unknown");
+                    break;
+                case 6:
+                    order = cmp(age(*a, *shown), age(*b, *shown));
+                    break;
+                case 7:
+                    order = cmp(a->caller, b->caller);
+                    break;
+                case 8:
+                    order = cmp(ca && !ca->strings().empty() ? ca->strings()[0].value : "",
+                                cb && !cb->strings().empty() ? cb->strings()[0].value : "");
+                    break;
+                case 9:
+                    order = cmp(a->thread, b->thread);
+                    break;
+                case 10:
+                    order = cmp(a->id.generation, b->id.generation);
+                    break;
+                }
+                if (!order)
+                    order = cmp(a->id.generation, b->id.generation);
+                return ascending ? order < 0 : order > 0;
+            });
+            sorted_column = column;
+            sorted_ascending = ascending;
+        }
+        if (spec)
+            spec->SpecsDirty = false;
         ImGuiListClipper clip;
         clip.Begin(int(rows.size()));
         while (clip.Step())
@@ -435,8 +470,8 @@ void UI::allocation_table() {
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(hex_address(a.caller).c_str());
                 ImGui::TableNextColumn();
-                if (c && !c->strings.empty())
-                    ImGui::TextUnformatted(c->strings[0].value.c_str());
+                if (c && !c->strings().empty())
+                    ImGui::TextUnformatted(c->strings()[0].value.c_str());
                 else
                     muted(c ? "binary / no strings" : "not sampled");
                 ImGui::TableNextColumn();
@@ -534,6 +569,7 @@ void UI::details() {
     bool watched = shown->watched.contains(selected);
     if (ImGui::Checkbox("Prioritize sampling", &watched))
         controller.watch(selected, watched);
+    const Capture *selected_capture = nullptr;
     if (a.captures.empty()) {
         empty("No captured bytes", "Sampling is bounded. Freed or uncertain records are never reread. Choose "
                                    "Sample now while recording to request another scan.");
@@ -544,8 +580,9 @@ void UI::details() {
         if (ImGui::SliderInt("##capture", &index, 0, int(a.captures.size()) - 1, "Capture %d"))
             capture_index = index;
         const auto &c = a.captures[index];
+        selected_capture = &c;
         heading("Captured content");
-        ImGui::Text("%zu bytes | entropy %.3f bits/byte", c.bytes.size(), c.entropy);
+        ImGui::Text("%zu bytes | entropy %.3f bits/byte", c.bytes().size(), c.entropy);
         ImGui::Text("QPC %llu .. %llu", c.begin, c.end);
         ImGui::Text("FNV-1a64 %016llX", c.hash);
         ImGui::TextWrapped("%s%s%s", c.attributed ? "Attributed observed range" : "UNSAFE attribution",
@@ -554,80 +591,93 @@ void UI::details() {
         if (!c.note.empty())
             ImGui::TextWrapped("%s", c.note.c_str());
         muted("Acquisition is non-atomic. Brief writes can be missed.");
-        if (c.bytes.size() < 256)
+        if (c.bytes().size() < 256)
             muted("Small sample: insufficient entropy evidence for findings.");
-        if (ImGui::BeginTabBar("inspect-tabs")) {
-            if (ImGui::BeginTabItem("Hex + ASCII")) {
-                if (ImGui::Button("Copy captured hex")) {
-                    std::string s;
-                    for (auto b : c.bytes) {
-                        char x[4]{};
-                        sprintf_s(x, "%02X ", b);
-                        s += x;
-                    }
-                    ImGui::SetClipboardText(s.c_str());
+    }
+    if (ImGui::BeginTabBar("inspect-tabs")) {
+        if (selected_capture && ImGui::BeginTabItem("Hex + ASCII")) {
+            const auto &c = *selected_capture;
+            if (ImGui::Button("Copy captured hex")) {
+                std::string s;
+                for (auto b : c.bytes()) {
+                    char x[4]{};
+                    sprintf_s(x, "%02X ", b);
+                    s += x;
                 }
-                ImGui::BeginChild("hex", ImVec2(0, 250), ImGuiChildFlags_Borders,
-                                  ImGuiWindowFlags_HorizontalScrollbar);
-                if (ImGui::GetIO().Fonts->Fonts.Size > 1)
-                    ImGui::PushFont(ImGui::GetIO().Fonts->Fonts[1]);
-                std::string dump;
-                for (size_t offset = 0; offset < c.bytes.size(); offset += 16) {
-                    char row[160]{};
-                    sprintf_s(row, "%08llX  ", c.offset + offset);
-                    dump += row;
-                    std::string ascii;
-                    for (size_t j = 0; j < 16; ++j) {
-                        if (offset + j < c.bytes.size()) {
-                            uint8_t b = c.bytes[offset + j];
-                            sprintf_s(row, "%02X ", b);
-                            dump += row;
-                            ascii += (b >= 32 && b < 127) ? char(b) : '.';
-                        } else
-                            dump += "   ";
-                    }
-                    dump += " | " + ascii + "\n";
+                ImGui::SetClipboardText(s.c_str());
+            }
+            ImGui::BeginChild("hex", ImVec2(0, 250), ImGuiChildFlags_Borders,
+                              ImGuiWindowFlags_HorizontalScrollbar);
+            if (ImGui::GetIO().Fonts->Fonts.Size > 1)
+                ImGui::PushFont(ImGui::GetIO().Fonts->Fonts[1]);
+            std::string dump;
+            for (size_t offset = 0; offset < c.bytes().size(); offset += 16) {
+                char row[160]{};
+                sprintf_s(row, "%08llX  ", c.offset + offset);
+                dump += row;
+                std::string ascii;
+                for (size_t j = 0; j < 16; ++j) {
+                    if (offset + j < c.bytes().size()) {
+                        uint8_t b = c.bytes()[offset + j];
+                        sprintf_s(row, "%02X ", b);
+                        dump += row;
+                        ascii += (b >= 32 && b < 127) ? char(b) : '.';
+                    } else
+                        dump += "   ";
                 }
-                // Read-only input permits text selection and native Ctrl+C over offsets, hex and ASCII.
-                std::vector<char> buffer(dump.begin(), dump.end());
-                buffer.push_back(0);
-                ImGui::InputTextMultiline("##hex-text", buffer.data(), buffer.size(),
-                                          ImVec2(700, ImGui::GetContentRegionAvail().y),
-                                          ImGuiInputTextFlags_ReadOnly);
-                if (ImGui::GetIO().Fonts->Fonts.Size > 1)
-                    ImGui::PopFont();
-                ImGui::EndChild();
-                ImGui::EndTabItem();
+                dump += " | " + ascii + "\n";
             }
-            if (ImGui::BeginTabItem("Strings")) {
-                for (size_t i = 0; i < c.strings.size(); ++i) {
-                    const auto &s = c.strings[i];
-                    ImGui::PushID(int(i));
-                    ImGui::Text("+%08llX  %s", s.offset, s.encoding.c_str());
-                    if (ImGui::Selectable(s.value.c_str()))
-                        ImGui::SetClipboardText(s.value.c_str());
-                    ImGui::PopID();
-                }
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("History")) {
-                for (const auto &h : a.history)
-                    ImGui::Text("QPC %llu | %s | %llu bytes", h.ticks, hex_address(h.address).c_str(),
-                                h.size);
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("Findings")) {
-                for (const auto &f : shown->findings)
-                    if (f.generation == selected) {
-                        heading(f.title.c_str());
-                        ImGui::TextWrapped("%s", f.evidence.c_str());
-                        ImGui::TextWrapped("%s | confidence %s", f.rule.c_str(), f.confidence.c_str());
-                        ImGui::Text("QPC %llu .. %llu", f.begin, f.end);
-                    }
-                ImGui::EndTabItem();
-            }
-            ImGui::EndTabBar();
+            // Read-only input permits text selection and native Ctrl+C over offsets, hex and ASCII.
+            std::vector<char> buffer(dump.begin(), dump.end());
+            buffer.push_back(0);
+            ImGui::InputTextMultiline("##hex-text", buffer.data(), buffer.size(),
+                                      ImVec2(700, ImGui::GetContentRegionAvail().y),
+                                      ImGuiInputTextFlags_ReadOnly);
+            if (ImGui::GetIO().Fonts->Fonts.Size > 1)
+                ImGui::PopFont();
+            ImGui::EndChild();
+            ImGui::EndTabItem();
         }
+        if (selected_capture && ImGui::BeginTabItem("Strings")) {
+            const auto &c = *selected_capture;
+            for (size_t i = 0; i < c.strings().size(); ++i) {
+                const auto &s = c.strings()[i];
+                ImGui::PushID(int(i));
+                ImGui::Text("+%08llX  %s", s.offset, s.encoding.c_str());
+                if (ImGui::Selectable(s.value.c_str()))
+                    ImGui::SetClipboardText(s.value.c_str());
+                ImGui::PopID();
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Stack", nullptr, select_stack_tab ? ImGuiTabItemFlags_SetSelected : 0)) {
+            select_stack_tab = false;
+            if (!a.stack_count)
+                ImGui::TextWrapped(
+                    "%s", a.stack_status == 2
+                              ? "Stack unavailable; native capture was rejected or failed"
+                              : "No stack was captured. Enable up to eight frames under Limits & rules.");
+            for (uint32_t n = 0; n < a.stack_count; ++n)
+                ImGui::TextWrapped("%u  %s  %s", n, hex_address(a.stack[n]).c_str(),
+                                   shown->offline ? "saved address" : controller.symbol(a.stack[n]).c_str());
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("History")) {
+            for (const auto &h : a.history)
+                ImGui::Text("QPC %llu | %s | %llu bytes", h.ticks, hex_address(h.address).c_str(), h.size);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Findings")) {
+            for (const auto &f : shown->findings)
+                if (f.generation == selected) {
+                    heading(f.title.c_str());
+                    ImGui::TextWrapped("%s", f.evidence.c_str());
+                    ImGui::TextWrapped("%s | confidence %s", f.rule.c_str(), f.confidence.c_str());
+                    ImGui::Text("QPC %llu .. %llu", f.begin, f.end);
+                }
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
     }
     heading("Observed protections");
     for (const auto &r : shown->regions)
@@ -664,7 +714,10 @@ void UI::bottom() {
                         ImGui::TableNextColumn();
                         ImGui::TextUnformatted(hex_address(e.op == Op::free ? e.previous : e.result).c_str());
                         ImGui::TableNextColumn();
-                        ImGui::Text("%llu%s", e.requested, e.reserved ? " exception" : "");
+                        ImGui::Text("%llu%s", e.requested,
+                                    (e.reserved & 1)   ? " exception"
+                                    : (e.reserved & 2) ? " stack gap"
+                                                       : "");
                         ImGui::TableNextColumn();
                         ImGui::Text("%u", e.thread);
                         ImGui::TableNextColumn();
@@ -684,7 +737,7 @@ void UI::bottom() {
             std::vector<Row> rows;
             for (const auto &[_, a] : shown->records)
                 for (const auto &c : a.captures)
-                    for (const auto &s : c.strings)
+                    for (const auto &s : c.strings())
                         if (!*search || s.value.find(search) != std::string::npos)
                             rows.push_back({&a, &c, &s});
             if (ImGui::BeginTable("allstrings", 4,
@@ -847,7 +900,7 @@ void UI::dialogs() {
         ImGui::SetNextItemWidth(550);
         ImGui::InputText("Executable", launch_path, sizeof(launch_path));
         if (ImGui::Button("Browse executable...")) {
-            auto p = file_dialog(false, L"Executables\0*.exe\0", L"exe");
+            auto p = choose_file(false, L"Executables\0*.exe\0", L"exe");
             if (!p.empty())
                 strncpy_s(launch_path, narrow(p).c_str(), _TRUNCATE);
         }
@@ -876,11 +929,17 @@ void UI::dialogs() {
         static Limits l;
         static int bytes = 4096, scan = 1024, session = 32, interval = 1000, minimum = 4;
         static float threshold = 7.2f, fraction = .35f, delta = 1.5f;
+        static int retention = 0, stack_frames = 0;
         ImGui::InputInt("Bytes per allocation", &bytes);
         ImGui::InputInt("KiB per scan", &scan);
         ImGui::InputInt("MiB retained live bytes", &session);
         ImGui::InputInt("Sample interval ms", &interval);
         ImGui::InputInt("Minimum string characters", &minimum);
+        const char *retention_modes[] = {"Rolling oldest samples", "Stop at capacity"};
+        ImGui::Combo("Retention policy", &retention, retention_modes, 2);
+        ImGui::SliderInt("Optional stack frames", &stack_frames, 0, max_stack_frames);
+        ImGui::TextWrapped("Stack capture is disabled by default. Enabling it requires the target agent's "
+                           "allocation-free native unwinder probe to pass and adds per-call work.");
         ImGui::SliderFloat("High entropy bits/byte", &threshold, 0, 8);
         ImGui::SliderFloat("Changed fraction", &fraction, 0, 1);
         ImGui::SliderFloat("Entropy delta", &delta, 0, 8);
@@ -892,6 +951,8 @@ void UI::dialogs() {
             l.per_session = size_t(std::max(0, session)) * 1048576;
             l.sample_ms = unsigned(std::max(0, interval));
             l.min_string = size_t(std::max(0, minimum));
+            l.retention = static_cast<Retention>(retention);
+            l.stack_frames = static_cast<unsigned>(stack_frames);
             l.high_entropy = threshold;
             l.changed_fraction = fraction;
             l.entropy_change = delta;

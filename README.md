@@ -22,7 +22,7 @@ Keep `HeapglassAgent.dll` beside `Heapglass.exe`. The release build statically l
 
 1. Use **Session > Launch test target**, **Launch executable**, or **Attach to process**. Launch accepts arguments and a working directory.
 2. Select an allocation to inspect captured hex, strings, size history, caller symbols, and findings. The string filter searches captured text.
-3. Use **Sample now** or prioritize selected allocations. Configure sample budgets, interval, string length, and rule thresholds under **Limits & rules**.
+3. Use **Sample now** or prioritize selected allocations. Configure sample budgets, retention mode, interval, string length, optional stack frames, and rule thresholds under **Limits & rules**. Rolling retention evicts the oldest captures at capacity. Stop-at-capacity mode skips new samples instead. The session panel reports evictions, skipped samples, queue backlogs, and event loss.
 4. Capture named snapshots. Compare them in the bottom panel. Counts distinguish samples acquired during the snapshot interval from older retained captures.
 5. Open the separate process memory map from the left panel. It reports committed private, mapped, and image regions, their protections, and available module and mapped-file associations.
 6. Use **Save session / export JSON**, **Open saved session**, or **Export allocation CSV**. Raw sampled bytes are excluded by default. Enable **Include sampled bytes in JSON** to retain them. Extracted text remains in the JSON and may contain sensitive process data.
@@ -35,7 +35,11 @@ The view contains allocations observed since instrumentation began, not a comple
 
 Only native x64 processes on x64 Windows are supported. Access checks, protected processes, signature policies, different-user sessions, or unavailable fixed TLS slots can prevent instrumentation. Heap hooks miss custom allocators that do not call the Rtl heap family. Virtual-memory protections are polled, and ordinary writes are sampled. Sampling is non-atomic and can miss brief changes.
 
-The current allocation-burst benchmark loses many events and reduces throughput substantially. Do not use this version where complete high-rate event capture is required. Loss, retention eviction, recording gaps, and overlapping operations produce explicit incomplete or uncertain state.
+A dedicated collector drains the target ring independently of sampling and analysis. The bounded queues still permit loss when full. Loss, allocation-record eviction, recording gaps, and overlapping operations produce explicit incomplete or uncertain state. Capture eviction removes historical samples without inventing allocation events. The larger queues increase controller memory use; see the measured tradeoff in the validation report.
+
+ASCII, validated UTF-8, and UTF-16LE extraction retain exact byte offsets. Unicode candidates use Windows character classification and a limited supplementary repertoire. Installed CJK and emoji fonts extend display coverage, but the interface has no full RTL shaping. Optional stacks are disabled by default, capped at eight frames, and require an allocation-free unwinder probe.
+
+Version 0.2 uses IPC protocol 2 and session format 2. It reads format 1 sessions. Restart targets carrying an older resident agent before attaching with this version.
 
 See [coverage and architecture](docs/coverage.md), [validation and measured performance](docs/validation.md), and [API references](docs/references.md). The tests and screenshots establish operation on the documented fixture, not detection of arbitrary malicious software.
 
@@ -49,6 +53,6 @@ cmake --install build --config Release --prefix out/Heapglass
 Compress-Archive -Path out/Heapglass/* -DestinationPath out/Heapglass-windows-x64.zip -Force
 ```
 
-`--capture` runs the controlled target, renders the application without desktop input, exports allocation and memory-map PNGs beside the executable, and exits after about 12 seconds. The target continues until its 20-second workload finishes. `--profile` writes CPU draw-time and frame-time measurements on clean UI exit. `--test-target` opens the ordinary interface against a 180-second fixture.
+`--capture` runs the controlled target with eight stack frames, renders the application without desktop input, exports allocation, memory-map, and stack PNGs beside the executable, and exits after about 16 seconds. The target continues until its 20-second workload finishes. `--profile` writes CPU draw-time and frame-time measurements on clean UI exit. `--test-target` opens the ordinary interface against a 180-second fixture.
 
 Third-party license notices and exact source checksums are under `third_party` in the source checkout. The binary package retains license notices under `licenses`. The Win32/DX11 lifecycle adapts Dear ImGui's licensed example.
