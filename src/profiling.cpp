@@ -123,13 +123,16 @@ const char *growth_coverage_name(GrowthCoverage coverage) {
 }
 GrowthReport analyze_growth(std::span<const Snapshot> snapshots) {
     GrowthReport report;
-    report.observations = snapshots.size();
-    if (snapshots.size() < 2)
-        return report;
     std::vector<const Snapshot *> ordered;
     for (const auto &s : snapshots)
         ordered.push_back(&s);
     std::stable_sort(ordered.begin(), ordered.end(), [](auto a, auto b) { return a->begin < b->begin; });
+    const auto baseline = std::find_if(ordered.begin(), ordered.end(), [](auto s) { return s->pinned; });
+    if (baseline != ordered.end())
+        ordered.erase(ordered.begin(), baseline);
+    report.observations = ordered.size();
+    if (ordered.size() < 2)
+        return report;
     const auto &first = *ordered.front();
     const auto &last = *ordered.back();
     report.session = first.session;

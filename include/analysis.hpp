@@ -62,6 +62,7 @@ struct Finding {
     uint64_t address{}, begin{}, end{}, generation{};
 };
 enum class Retention { rolling, stop_at_capacity };
+enum class SnapshotMode { with_content, metadata_only };
 struct Limits {
     size_t per_allocation = 4096, per_scan = 1024 * 1024, per_session = 32 * 1024 * 1024;
     size_t records = 50000, events = 10000, captures = 8, min_string = 4;
@@ -75,6 +76,17 @@ struct Snapshot {
     uint64_t begin{}, end{}, session{};
     bool incomplete{};
     std::vector<Allocation> records;
+    uint64_t id{};
+    bool history_truncated{}, pinned{};
+    SnapshotMode mode = SnapshotMode::with_content;
+};
+enum class SymbolQuality { unresolved, module, symbol };
+struct FrameSymbol {
+    SymbolQuality quality = SymbolQuality::unresolved;
+    std::string module, image_path, name;
+    uint64_t rva{}, displacement{}, resolved_at{};
+    uint32_t image_size{}, timestamp{}, checksum{}, pdb_age{};
+    std::array<uint8_t, 16> pdb_guid{};
 };
 enum class Change { added, freed, resized, modified, unchanged, uncertain };
 struct Difference {
@@ -88,7 +100,7 @@ struct Model {
     DWORD pid{};
     uint64_t creation{};
     std::string process, status = "No session", start_time;
-    bool incomplete{}, recording{}, connected{}, offline{}, sampling_budget_exhausted{};
+    bool incomplete{}, recording{}, connected{}, offline{}, sampling_budget_exhausted{}, history_truncated{};
     uint64_t evicted_captures{}, skipped_captures{}, controller_dropped{}, transport_pending{},
         analysis_pending{}, stack_violations{};
     uint32_t active_stack_frames{}, stack_state{};
@@ -105,11 +117,14 @@ struct Model {
     std::vector<Region> regions;
     std::vector<Finding> findings;
     std::vector<Snapshot> snapshots;
+    std::map<uint64_t, FrameSymbol> frame_symbols;
+    unsigned snapshot_interval_ms{};
     std::shared_ptr<const AllocationProfile> allocation_profile;
     std::shared_ptr<const GrowthReport> growth_report;
     std::set<uint64_t> watched;
     uint64_t next_generation = 1, next_heap = 1, unsafe_through = 0, next_capture = 1;
     std::map<uint64_t, uint64_t> capture_owners;
+    uint64_t next_snapshot = 1;
     void apply(const Event &e);
     void loss(uint64_t total, uint64_t through = 0);
     void boundary();
@@ -118,7 +133,10 @@ struct Model {
     void rebuild_retention();
     Model presentation() const;
     void analyze();
-    Snapshot snapshot(std::string name, uint64_t begin, uint64_t end) const;
+    Snapshot snapshot(std::string name, uint64_t begin, uint64_t end,
+                      SnapshotMode mode = SnapshotMode::with_content) const;
+    void add_snapshot(Snapshot snapshot);
+    void pin_snapshot(uint64_t id, bool pinned);
     void prune();
 };
 Limits validated_limits(Limits limits);
@@ -132,4 +150,5 @@ std::vector<Difference> compare(const Snapshot &a, const Snapshot &b);
 void save_session(const Model &, const std::wstring &path, bool include_bytes);
 Model load_session(const std::wstring &path);
 void export_csv(const Model &, const std::wstring &path);
+std::string frame_label(const Model &, uint64_t address);
 } // namespace hg

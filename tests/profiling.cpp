@@ -2,6 +2,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 using namespace hg;
 #define CHECK(x)                                                                                             \
@@ -178,6 +179,71 @@ void growth_semantics() {
     CHECK(!r.rows[0].sustained_growth);
     CHECK(byte_delta(r.rows[0].before.live_bytes, r.rows[0].after.live_bytes) == "-63");
 }
+void churn_and_baselines() {
+    Model m;
+    m.session = 44;
+    m.limits.records = 3;
+    m.apply(alloc(1, 0x2000, 64));
+    uint64_t order = 3;
+    for (unsigned i = 0; i < 12; ++i) {
+        m.apply(alloc(order, 0x3000, 32));
+        Event freed{};
+        freed.op = Op::free;
+        freed.begin = order + 2;
+        freed.end = order + 3;
+        freed.heap = 0x1000;
+        freed.previous = 0x3000;
+        freed.result = 1;
+        m.apply(freed);
+        order += 4;
+    }
+    CHECK(m.history_truncated);
+    CHECK(!m.incomplete);
+    m.add_snapshot(m.snapshot("baseline", 1000, 1010, SnapshotMode::metadata_only));
+    const auto baseline = m.snapshots.front().id;
+    m.pin_snapshot(baseline, true);
+    m.apply(alloc(order, 0x4000, 128));
+    m.add_snapshot(m.snapshot("growth one", 2000, 2010, SnapshotMode::metadata_only));
+    m.apply(alloc(order + 2, 0x5000, 256));
+    m.add_snapshot(m.snapshot("growth two", 3000, 3010, SnapshotMode::metadata_only));
+    CHECK(!m.incomplete);
+    CHECK(analyze_growth(m.snapshots).rows[0].sustained_growth);
+    CHECK(analyze_growth(m.snapshots).rows[0].after.live_bytes == 448);
+    for (unsigned i = 0; i < 5; ++i)
+        m.add_snapshot(m.snapshot("later", 4000 + i * 100, 4010 + i * 100, SnapshotMode::metadata_only));
+    CHECK(m.snapshots.size() == 4);
+    CHECK(m.snapshots.front().id == baseline);
+    CHECK(m.snapshots.front().pinned);
+    CHECK(m.snapshots[1].begin == 4200);
+    m.pin_snapshot(m.snapshots[2].id, true);
+    CHECK(analyze_growth(m.snapshots).observations == 2);
+    m.apply(alloc(order + 4, 0x6000, 512));
+    CHECK(m.incomplete);
+    auto metadata = m.snapshot("metadata", 6000, 6010, SnapshotMode::metadata_only);
+    CHECK(metadata.history_truncated);
+    for (const auto &a : metadata.records) {
+        CHECK(a.history.empty());
+        CHECK(a.captures.empty());
+        CHECK(a.life != Life::freed);
+    }
+    auto unchanged = fixture();
+    const auto before = unchanged.snapshot("metadata", 1000, 1010, SnapshotMode::metadata_only);
+    const auto after = unchanged.snapshot("content", 2000, 2010);
+    for (const auto &d : compare(before, after))
+        CHECK(d.id.generation != 6); // Generation 6 was freed before either observation.
+    for (const auto &d : compare(after, before))
+        CHECK(d.id.generation != 6);
+    auto other_session = after;
+    other_session.session = 45;
+    for (auto &a : other_session.records)
+        a.id.session = 45;
+    for (const auto &differences : {compare(before, other_session), compare(other_session, before)}) {
+        bool historical_uncertain = false;
+        for (const auto &d : differences)
+            historical_uncertain |= d.id.generation == 6 && d.change == Change::uncertain;
+        CHECK(historical_uncertain);
+    }
+}
 std::string read(const std::filesystem::path &path) {
     std::ifstream file(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(file), {}};
@@ -193,12 +259,12 @@ void exports_and_reload() {
         }
     } cleanup{path};
     auto m = fixture();
-    export_sites_csv(summarize_allocations(m, 1000), path.wstring());
+    export_sites_csv(summarize_allocations(m, 1000), path.wstring(), m.frame_symbols);
     const auto sites = read(path);
     CHECK(sites.find("44,1000,0,\"bounded stack\",\"4369;8738\",2,192,1,8,1,24,1,10,0") != std::string::npos);
     auto snapshots = growing();
     snapshots.front().name = "=untrusted,\"name\"";
-    export_growth_csv(analyze_growth(snapshots), path.wstring());
+    export_growth_csv(analyze_growth(snapshots), path.wstring(), m.frame_symbols);
     const auto growth = read(path);
     CHECK(growth.find("\"'=untrusted,\"\"name\"\"\"") != std::string::npos);
     CHECK(growth.find(",1,3,64,224,\"'+160\",0,0,1,64,2,1,0") != std::string::npos);
@@ -208,12 +274,79 @@ void exports_and_reload() {
     CHECK(summarize_allocations(loaded, UINT64_MAX).totals.live_bytes == 240);
     CHECK(analyze_growth(loaded.snapshots).rows[0].after.live_bytes == 224);
     CHECK(analyze_growth(loaded.snapshots).rows[0].sustained_growth);
+    FrameSymbol symbol;
+    symbol.quality = SymbolQuality::symbol;
+    symbol.module = "fixture";
+    symbol.image_path = "C:/fixture/target.exe";
+    symbol.name = "RetainedBuffer";
+    symbol.rva = 0x111;
+    symbol.displacement = 0x11;
+    symbol.image_size = 0x4000;
+    symbol.timestamp = 0x12345678;
+    symbol.checksum = 0x4455;
+    symbol.resolved_at = 600;
+    symbol.pdb_age = 3;
+    symbol.pdb_guid[0] = 0xab;
+    m.frame_symbols.emplace(0x1111, symbol);
+    auto unicode = symbol;
+    unicode.name.clear();
+    for (unsigned i = 0; i < 1700; ++i)
+        unicode.name += "世";
+    m.frame_symbols.emplace(0x2222, unicode);
+    m.history_truncated = true;
+    m.snapshots.clear();
+    m.add_snapshot(m.snapshot("metadata baseline", 700, 710, SnapshotMode::metadata_only));
+    m.pin_snapshot(m.snapshots.front().id, true);
+    save_session(m, path.wstring(), false);
+    loaded = load_session(path.wstring());
+    CHECK(frame_label(loaded, 0x1111) == "fixture!RetainedBuffer+0x11 [cached]");
+    CHECK(loaded.frame_symbols.at(0x1111).timestamp == 0x12345678);
+    CHECK(loaded.frame_symbols.at(0x1111).pdb_guid[0] == 0xab);
+    CHECK(loaded.frame_symbols.at(0x1111).pdb_age == 3);
+    CHECK(loaded.frame_symbols.at(0x2222).name == unicode.name);
+    CHECK(loaded.frame_symbols.at(0x2222).name.size() == 5100);
+    CHECK(loaded.history_truncated && !loaded.incomplete);
+    CHECK(loaded.snapshots.front().pinned);
+    CHECK(loaded.snapshots.front().mode == SnapshotMode::metadata_only);
+    auto saved = nlohmann::json::parse(read(path));
+    CHECK(saved["version"] == 3);
+    auto invalid = saved;
+    invalid["frame_symbols"][0]["rva"] = 0x4000u;
+    {
+        std::ofstream out(path);
+        out << invalid;
+    }
+    bool rejected = false;
+    try {
+        load_session(path.wstring());
+    } catch (const std::exception &) {
+        rejected = true;
+    }
+    CHECK(rejected);
+    auto legacy = saved;
+    legacy["version"] = 2;
+    legacy.erase("frame_symbols");
+    legacy.erase("history_truncated");
+    for (auto &s : legacy["snapshots"]) {
+        s.erase("id");
+        s.erase("pinned");
+        s.erase("mode");
+        s.erase("history_truncated");
+    }
+    {
+        std::ofstream out(path);
+        out << legacy;
+    }
+    loaded = load_session(path.wstring());
+    CHECK(frame_label(loaded, 0x1111) == "saved address; unresolved");
+    CHECK(!loaded.snapshots.front().pinned);
 }
 int main() {
     try {
         site_totals();
         reallocation_sites();
         growth_semantics();
+        churn_and_baselines();
         exports_and_reload();
         std::cout << "Allocation sites, conservative snapshot growth, age provenance, overflow and exports "
                      "passed\n";

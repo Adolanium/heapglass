@@ -179,6 +179,18 @@ hg::Model offline_fixture() {
     model.status = "OFFLINE UI FIXTURE: synthetic saved observations";
     model.start_time = "Offline fixture, no target process";
     model.offline = true;
+    model.limits.per_allocation = 2048;
+    model.limits.per_scan = 65537;
+    model.limits.per_session = 2097153;
+    model.limits.sample_ms = 345;
+    model.limits.stack_frames = 3;
+    model.limits.retention = hg::Retention::stop_at_capacity;
+    hg::FrameSymbol saved_symbol;
+    saved_symbol.quality = hg::SymbolQuality::module;
+    saved_symbol.module = "FixtureAlpha";
+    saved_symbol.rva = 2;
+    saved_symbol.image_size = 65536;
+    model.frame_symbols.emplace(0x77770002, saved_symbol);
     const uint64_t sizes[] = {768, 128, 384};
     const char *strings[] = {"alpha-current-marker", "beta-current-marker", "gamma-current-marker"};
     for (uint64_t i = 0; i < 3; ++i) {
@@ -242,6 +254,31 @@ void exercise_ui() {
     h.contains("OFFLINE");
     h.contains("OFFLINE UI FIXTURE.exe");
     h.contains("3 / 3 records");
+    h.click("##MainMenuBar", "Limits & rules");
+    h.click("Sampling limits & rules", "Sample interval ms");
+    h.key(ImGuiKey_A, true);
+    ImGui::GetIO().AddInputCharactersUTF8("777");
+    h.frame();
+    h.click("Sampling limits & rules", "Apply");
+    const auto settings_deadline = GetTickCount64() + 5000;
+    while (h.app.controller.view()->limits.sample_ms != 777 && GetTickCount64() < settings_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto applied = h.app.controller.view()->limits;
+    require(applied.sample_ms == 777 && applied.per_allocation == 2048 && applied.per_scan == 65537 &&
+                applied.per_session == 2097153 && applied.stack_frames == 3 &&
+                applied.retention == hg::Retention::stop_at_capacity,
+            "Changing one loaded setting overwrote other active settings");
+    h.click("##MainMenuBar", "Limits & rules");
+    h.click("Sampling limits & rules", "Bytes per allocation");
+    h.key(ImGuiKey_A, true);
+    ImGui::GetIO().AddInputCharactersUTF8("16384");
+    h.frame();
+    h.click("Sampling limits & rules", "Cancel");
+    h.click("##MainMenuBar", "Limits & rules");
+    h.click("Sampling limits & rules", "Apply");
+    h.frame();
+    require(h.app.controller.view()->limits.per_allocation == 2048,
+            "Cancelled settings leaked into the next draft");
     h.app.show_allocation_sites();
     for (int i = 0; i < 3; ++i)
         h.frame();
@@ -278,6 +315,7 @@ void exercise_ui() {
     h.click("Allocations & memory map", "0000000000002000");
     h.contains("0000000000002000 | 128 bytes | LIVE");
     h.contains("Heap generation 1 | allocation 2");
+    h.contains("FixtureAlpha+0x2");
     h.click("Investigation", "Allocation sites");
     h.contains("Known live: 3 blocks | 1280 requested bytes | uncertain: 0 blocks");
     h.click("Investigation", "0000000077770001 | bounded stack (2 frames)");
@@ -348,6 +386,7 @@ void exercise_ui() {
             "Dragging the dock splitter did not resize the visible sidebar by about 60 pixels");
 
     auto unsampled = offline_fixture();
+    unsampled.frame_symbols.clear();
     auto &allocation = unsampled.records.at(1);
     allocation.captures.clear();
     allocation.stack_count = 1;
@@ -370,6 +409,10 @@ void exercise_ui() {
     require(h.app.controller.view() != previous_view, "Controller did not reload the unsampled fixture");
     for (int i = 0; i < 5; ++i)
         h.frame();
+    h.click("Allocations & memory map", "0000000000002000");
+    h.contains("saved address; unresolved");
+    require(h.log.find("FixtureAlpha") == std::string::npos,
+            "An offline session reused another session's symbols");
     h.click("Allocations & memory map", "0000000000001000");
     h.contains("No captured bytes");
     h.click("Inspector", "Stack");

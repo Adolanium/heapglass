@@ -55,9 +55,84 @@ bool api_semantics() {
     HeapDestroy(heap);
     return valid && raised;
 }
+int sustained_workload(unsigned duration, unsigned growth_ms, const std::wstring &metrics) {
+    HANDLE heap = HeapCreate(0, 0, 0);
+    if (!heap)
+        return 4;
+    std::atomic<bool> stop = false, failed = false;
+    std::atomic<uint64_t> operations = 0;
+    std::vector<std::thread> workers;
+    for (unsigned t = 0; t < 4; ++t)
+        workers.emplace_back([&, t] {
+            auto local = HeapCreate(0, 0, 0);
+            if (!local) {
+                failed = true;
+                return;
+            }
+            uint64_t count = 0;
+            while (!stop.load()) {
+                uint64_t batch = 0;
+                for (unsigned i = 0; i < 16; ++i) {
+                    auto p = HeapAlloc(local, 0, 64 + ((++count + t) % 1024));
+                    ++batch;
+                    if (p) {
+                        static_cast<char *>(p)[0] = char('a' + t);
+                        if (count % 3 == 0) {
+                            auto resized = HeapReAlloc(local, 0, p, 1200);
+                            ++batch;
+                            if (resized)
+                                p = resized;
+                        }
+                        HeapFree(local, 0, p);
+                        ++batch;
+                    }
+                }
+                operations.fetch_add(batch);
+                Sleep(25);
+            }
+            HeapDestroy(local);
+        });
+    std::vector<void *> retained;
+    retained.reserve(uint64_t(duration) * 1000 / growth_ms + 1);
+    auto start = GetTickCount64(), next_growth = start;
+    while (!failed && GetTickCount64() - start < uint64_t(duration) * 1000) {
+        if (GetTickCount64() >= next_growth) {
+            auto p = static_cast<char *>(HeapAlloc(heap, HEAP_ZERO_MEMORY, 4096));
+            if (!p) {
+                failed = true;
+                break;
+            }
+            strcpy_s(p, 4096, "Heapglass sustained retained fixture");
+            retained.push_back(p);
+            log("sustained-retained", heap, p, 4096);
+            truth.flush();
+            next_growth = GetTickCount64() + growth_ms;
+        }
+        Sleep(10);
+    }
+    stop = true;
+    for (auto &thread : workers)
+        thread.join();
+    double seconds = double(GetTickCount64() - start) / 1000.;
+    const uint64_t first = retained.empty() ? 0 : reinterpret_cast<uint64_t>(retained.front());
+    const uint64_t last = retained.empty() ? 0 : reinterpret_cast<uint64_t>(retained.back());
+    const auto result =
+        "{\"operations\":" + std::to_string(operations.load()) + ",\"seconds\":" + std::to_string(seconds) +
+        ",\"operations_per_second\":" + std::to_string(double(operations.load()) / seconds) +
+        ",\"retained_count\":" + std::to_string(retained.size()) +
+        ",\"first_retained\":" + std::to_string(first) + ",\"last_retained\":" + std::to_string(last) + "}";
+    if (!metrics.empty()) {
+        std::ofstream output{std::filesystem::path(metrics)};
+        output << result;
+    }
+    HeapDestroy(heap);
+    return failed ? 5 : 0;
+}
 int wmain(int argc, wchar_t **argv) {
     unsigned duration = 30;
     bool burst = false;
+    bool sustained = false;
+    unsigned growth_ms = 5000;
     uint64_t benchmark = 0;
     std::wstring ground, metrics;
     for (int i = 1; i < argc; ++i) {
@@ -66,6 +141,10 @@ int wmain(int argc, wchar_t **argv) {
             duration = std::stoul(argv[++i]);
         else if (a == L"--burst")
             burst = true;
+        else if (a == L"--sustained")
+            sustained = true;
+        else if (a == L"--growth-ms" && i + 1 < argc)
+            growth_ms = std::stoul(argv[++i]);
         else if (a == L"--ground" && i + 1 < argc)
             ground = argv[++i];
         else if (a == L"--benchmark" && i + 1 < argc)
@@ -76,6 +155,11 @@ int wmain(int argc, wchar_t **argv) {
     Sleep(1200); // Allow a launching controller to instrument before this controlled workload.
     if (!ground.empty())
         truth.open(std::filesystem::path(ground));
+    if (sustained) {
+        if (!duration || duration > 600 || growth_ms < 100 || growth_ms > 60000)
+            return 2;
+        return sustained_workload(duration, growth_ms, metrics);
+    }
     if (benchmark) {
         auto h = HeapCreate(0, 0, 0);
         LARGE_INTEGER f{}, b{}, e{};

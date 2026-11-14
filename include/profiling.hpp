@@ -52,6 +52,7 @@ struct GrowthReport {
 const char *growth_coverage_name(GrowthCoverage);
 GrowthReport analyze_growth(std::span<const Snapshot>);
 std::string byte_delta(uint64_t before, uint64_t after);
-void export_sites_csv(const AllocationProfile &, const std::wstring &);
-void export_growth_csv(const GrowthReport &, const std::wstring &);
+void export_sites_csv(const AllocationProfile &, const std::wstring &,
+                      const std::map<uint64_t, FrameSymbol> &);
+void export_growth_csv(const GrowthReport &, const std::wstring &, const std::map<uint64_t, FrameSymbol> &);
 } // namespace hg

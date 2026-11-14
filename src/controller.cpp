@@ -180,35 +180,84 @@ void Controller::record(bool enabled) {
             if (enabled)
                 InterlockedExchange(&shared->recording, 1);
             model.recording = enabled;
+            if (!enabled)
+                model.snapshot_interval_ms = 0;
             model.status = enabled ? "Recording resumed; earlier coverage gap remains"
                                    : "Recording stopped; target continues; agent resident";
         }
     });
 }
-void Controller::take_snapshot(std::string name) {
-    enqueue([this, name = std::move(name)] {
-        auto b = ticks();
+void Controller::take_snapshot(std::string name, SnapshotMode mode) {
+    enqueue([this, name = std::move(name), mode] {
+        if (!shared || !model.recording || WaitForSingleObject(process_handle, 0) != WAIT_TIMEOUT)
+            throw std::runtime_error("Snapshots require an active recording");
+        capture_snapshot(name, mode);
+    });
+}
+void Controller::capture_snapshot(std::string name, SnapshotMode mode) {
+    auto b = ticks();
+    if (mode == SnapshotMode::with_content)
         sample();
-        auto s = model.snapshot(name, b, ticks());
-        size_t bytes = 0;
-        for (auto &a : s.records) {
-            while (a.captures.size() > 1)
-                a.captures.erase(a.captures.begin());
-            for (auto &c : a.captures) {
-                if (bytes + c.bytes().size() > 8 * 1024 * 1024) {
-                    auto content = std::make_shared<CapturedContent>();
-                    content->strings = c.strings();
-                    c.content = std::move(content);
-                    c.attributed = false;
-                    c.note = "Snapshot byte retention limit";
-                }
-                bytes += c.bytes().size();
+    bool cutoff_known = false;
+    uint64_t cutoff = ticks();
+    const auto deadline = GetTickCount64() + 100;
+    do {
+        drain();
+        const auto clock = atomic_read(&shared->clock);
+        const bool quiet = transport_quiet(shared, model.dropped, local_dropped.load()) &&
+                           pending_read.load() == pending_write.load();
+        cutoff = ticks();
+        cutoff_known = model.recording && atomic_read(&shared->recording) && quiet &&
+                       clock == atomic_read(&shared->clock) &&
+                       transport_quiet(shared, model.dropped, local_dropped.load()) &&
+                       pending_read.load() == pending_write.load();
+        if (cutoff_known || GetTickCount64() >= deadline)
+            break;
+        Sleep(1);
+    } while (true);
+    auto s = model.snapshot(std::move(name), mode == SnapshotMode::metadata_only ? cutoff : b, cutoff, mode);
+    s.incomplete = s.incomplete || !cutoff_known;
+    size_t bytes = 0;
+    for (auto &a : s.records) {
+        while (a.captures.size() > 1)
+            a.captures.erase(a.captures.begin());
+        for (auto &c : a.captures) {
+            if (bytes + c.bytes().size() > 8 * 1024 * 1024) {
+                auto content = std::make_shared<CapturedContent>();
+                content->strings = c.strings();
+                c.content = std::move(content);
+                c.attributed = false;
+                c.note = "Snapshot byte retention limit";
             }
+            bytes += c.bytes().size();
         }
-        model.snapshots.push_back(std::move(s));
+    }
+    model.add_snapshot(std::move(s));
+    growth_cache.reset();
+    dirty = true;
+}
+void Controller::pin_snapshot(uint64_t id, bool pinned) {
+    enqueue([this, id, pinned] {
+        model.pin_snapshot(id, pinned);
         growth_cache.reset();
-        if (model.snapshots.size() > 4)
-            model.snapshots.erase(model.snapshots.begin());
+    });
+}
+void Controller::schedule_snapshots(unsigned interval_ms) {
+    enqueue([this, interval_ms] {
+        if (interval_ms && (interval_ms < 1000 || interval_ms > 600000))
+            throw std::invalid_argument("Timed observation interval must be 1..600 seconds");
+        if (interval_ms && (!shared || !model.recording))
+            throw std::runtime_error("Timed snapshots require an active recording");
+        if (interval_ms && std::none_of(model.snapshots.begin(), model.snapshots.end(),
+                                        [](const auto &s) { return s.pinned; })) {
+            capture_snapshot("Timed baseline", SnapshotMode::metadata_only);
+            model.pin_snapshot(model.snapshots.back().id, true);
+        }
+        if (interval_ms && (!model.recording || !atomic_read(&shared->recording)))
+            throw std::runtime_error("Recording stopped while acquiring the timed baseline");
+        model.snapshot_interval_ms = interval_ms;
+        next_timed_snapshot = GetTickCount64() + interval_ms;
+        timed_sequence = 0;
     });
 }
 void Controller::watch(uint64_t g, bool enabled) {
@@ -258,13 +307,13 @@ void Controller::csv(std::wstring path) {
 }
 void Controller::sites_csv(std::wstring path) {
     enqueue([this, path = std::move(path)] {
-        export_sites_csv(summarize_allocations(model, ticks()), path);
+        export_sites_csv(summarize_allocations(model, ticks()), path, model.frame_symbols);
         model.status = "Allocation sites exported";
     });
 }
 void Controller::growth_csv(std::wstring path) {
     enqueue([this, path = std::move(path)] {
-        export_growth_csv(analyze_growth(model.snapshots), path);
+        export_growth_csv(analyze_growth(model.snapshots), path, model.frame_symbols);
         model.status = "Snapshot growth exported";
     });
 }
@@ -371,6 +420,11 @@ void Controller::loop(std::stop_token stop) {
                 } else {
                     drain();
                     auto now = GetTickCount64();
+                    if (model.recording && model.snapshot_interval_ms && now >= next_timed_snapshot) {
+                        capture_snapshot("Timed observation " + std::to_string(++timed_sequence),
+                                         SnapshotMode::metadata_only);
+                        next_timed_snapshot = GetTickCount64() + model.snapshot_interval_ms;
+                    }
                     if (force_sample || now - last_sample >= model.limits.sample_ms) {
                         auto b = ticks();
                         sample();
@@ -503,10 +557,8 @@ void Controller::connect(DWORD pid) {
     symbol_ticks = 0;
     if (pending_events.empty())
         pending_events.resize(pending_capacity);
-    {
-        std::lock_guard l(symbol_mutex);
-        symbols.clear();
-    }
+    symbol_jobs.clear();
+    queued_symbols.clear();
     process_handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE |
                                      PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD | SYNCHRONIZE,
                                  FALSE, pid);
@@ -682,6 +734,9 @@ void Controller::connect(DWORD pid) {
     }
 }
 void Controller::close() {
+    model.snapshot_interval_ms = 0;
+    symbol_jobs.clear();
+    queued_symbols.clear();
     if (shared) {
         InterlockedExchange(&shared->recording, 0);
         InterlockedExchange(&shared->disconnected, 1);
@@ -725,6 +780,7 @@ void Controller::drain() {
     if (model.recording && !atomic_read(&shared->recording)) {
         model.boundary();
         model.recording = false;
+        model.snapshot_interval_ms = 0;
         model.status = "Recording stopped after controller heartbeat expired; coverage gap";
     }
     auto begin = ticks();
@@ -743,8 +799,13 @@ void Controller::drain() {
     if (lost > model.dropped)
         dirty = true;
     model.loss(lost, atomic_read(&shared->clock));
-    for (const auto &event : batch)
+    for (const auto &event : batch) {
         model.apply(event);
+        queue_symbol(event.caller);
+        if (event.stack_count <= max_stack_frames)
+            for (unsigned i = 0; i < event.stack_count; ++i)
+                queue_symbol(event.stack[i]);
+    }
     apply_ticks.fetch_add(ticks() - begin, std::memory_order_relaxed);
 }
 void Controller::sample() {
@@ -869,45 +930,50 @@ void Controller::resolve() {
     if (!symbols_ready)
         return;
     unsigned budget = 8;
-    for (auto it = model.events.rbegin(); it != model.events.rend() && budget; ++it) {
-        for (uint32_t frame = 0; frame <= it->stack_count && budget; ++frame) {
-            auto address = frame ? it->stack[frame - 1] : it->caller;
-            if (!address)
-                continue;
-            {
-                std::lock_guard l(symbol_mutex);
-                if (symbols.contains(address))
-                    continue;
+    while (budget && !symbol_jobs.empty()) {
+        auto address = symbol_jobs.front();
+        symbol_jobs.pop_front();
+        queued_symbols.erase(address);
+        alignas(SYMBOL_INFOW) std::array<uint8_t, sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(wchar_t)>
+            buffer{};
+        auto *s = reinterpret_cast<SYMBOL_INFOW *>(buffer.data());
+        s->SizeOfStruct = sizeof(SYMBOL_INFOW);
+        s->MaxNameLen = MAX_SYM_NAME;
+        DWORD64 offset = 0;
+        FrameSymbol value;
+        value.resolved_at = ticks();
+        const bool named = SymFromAddrW(process_handle, address, &offset, s) != FALSE && s->NameLen > 0 &&
+                           s->NameLen < MAX_SYM_NAME;
+        IMAGEHLP_MODULEW64 m{};
+        m.SizeOfStruct = sizeof(m);
+        if (SymGetModuleInfoW64(process_handle, address, &m) && m.ModuleName[0] && address >= m.BaseOfImage &&
+            address - m.BaseOfImage < m.ImageSize) {
+            const bool named_in_module = named && offset <= address - m.BaseOfImage;
+            value.quality = named_in_module ? SymbolQuality::symbol : SymbolQuality::module;
+            value.module = narrow(m.ModuleName);
+            value.image_path = narrow(m.ImageName);
+            value.rva = address - m.BaseOfImage;
+            value.image_size = m.ImageSize;
+            value.timestamp = m.TimeDateStamp;
+            value.checksum = m.CheckSum;
+            value.pdb_age = m.PdbAge;
+            memcpy(value.pdb_guid.data(), &m.PdbSig70, value.pdb_guid.size());
+            if (named_in_module) {
+                value.name = narrow(std::wstring(s->Name, s->NameLen));
+                value.displacement = offset;
             }
-            alignas(SYMBOL_INFO) std::array<uint8_t, sizeof(SYMBOL_INFO) + MAX_SYM_NAME> buffer{};
-            auto *s = reinterpret_cast<SYMBOL_INFO *>(buffer.data());
-            s->SizeOfStruct = sizeof(SYMBOL_INFO);
-            s->MaxNameLen = MAX_SYM_NAME;
-            DWORD64 offset = 0;
-            std::string value;
-            if (SymFromAddr(process_handle, address, &offset, s))
-                value = std::string(s->Name, s->NameLen) + "+" + std::to_string(offset);
-            else {
-                IMAGEHLP_MODULE64 m{};
-                m.SizeOfStruct = sizeof(m);
-                if (SymGetModuleInfo64(process_handle, address, &m))
-                    value = std::string(m.ModuleName) + "+" + std::to_string(address - m.BaseOfImage);
-                else
-                    value = "unresolved";
-            }
-            {
-                std::lock_guard l(symbol_mutex);
-                if (symbols.size() > 10000)
-                    symbols.clear();
-                symbols[address] = std::move(value);
-            }
-            --budget;
         }
+        model.frame_symbols[address] = std::move(value);
+        dirty = true;
+        --budget;
     }
 }
+void Controller::queue_symbol(uint64_t address) {
+    if (address && model.frame_symbols.size() + symbol_jobs.size() < 10000 &&
+        !model.frame_symbols.contains(address) && queued_symbols.insert(address).second)
+        symbol_jobs.push_back(address);
+}
 std::string Controller::symbol(uint64_t address) const {
-    std::lock_guard l(symbol_mutex);
-    auto i = symbols.find(address);
-    return i == symbols.end() ? "resolving" : i->second;
+    return frame_label(*view(), address);
 }
 } // namespace hg

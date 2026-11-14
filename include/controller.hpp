@@ -32,7 +32,9 @@ class Controller {
     void launch(std::wstring path, std::wstring args = {}, std::wstring cwd = {});
     void disconnect();
     void record(bool enabled);
-    void take_snapshot(std::string name);
+    void take_snapshot(std::string name, SnapshotMode mode = SnapshotMode::with_content);
+    void pin_snapshot(uint64_t id, bool pinned);
+    void schedule_snapshots(unsigned interval_ms);
     void watch(uint64_t generation, bool enabled);
     void configure(Limits limits);
     void save(std::wstring path, bool bytes);
@@ -61,9 +63,10 @@ class Controller {
     void collect(std::stop_token, HANDLE idle_timer);
     void stop_collector();
     std::atomic<std::shared_ptr<const Model>> published;
-    mutable std::mutex jobs_mutex, symbol_mutex;
+    mutable std::mutex jobs_mutex;
     std::deque<std::function<void()>> jobs;
-    std::map<uint64_t, std::string> symbols;
+    std::deque<uint64_t> symbol_jobs;
+    std::set<uint64_t> queued_symbols;
     Model model;
     Limits desired_limits;
     std::shared_ptr<const GrowthReport> growth_cache;
@@ -71,6 +74,7 @@ class Controller {
     Shared *shared = nullptr;
     uint64_t last_sample = 0, last_region = 0, last_publish = 0, cursor = 0;
     bool symbols_ready = false, force_sample = false;
+    uint64_t next_timed_snapshot{}, timed_sequence{};
     void enqueue(std::function<void()>);
     void loop(std::stop_token);
     void connect(DWORD pid);
@@ -80,5 +84,7 @@ class Controller {
     void memory_map();
     void resolve();
     void publish();
+    void capture_snapshot(std::string name, SnapshotMode mode);
+    void queue_symbol(uint64_t address);
 };
 } // namespace hg

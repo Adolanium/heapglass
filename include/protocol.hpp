@@ -118,6 +118,9 @@ template <class Sink> bool transfer(Shared *s, Sink &&sink) {
 inline bool transport_quiet(Shared *s) noexcept {
     return atomic_read(&s->unbuffered_active) == 0 && atomic_read(&s->write) == atomic_read(&s->read);
 }
+inline bool transport_quiet(Shared *s, uint64_t applied_drops, uint64_t controller_drops) noexcept {
+    return transport_quiet(s) && uint64_t(atomic_read(&s->dropped)) + controller_drops == applied_drops;
+}
 inline void initialize(Shared *s, DWORD pid, uint64_t creation, uint64_t session) {
     s->magic = protocol_magic;
     s->version = protocol_version;

@@ -133,8 +133,16 @@
       "requirement": "The target agent's allocation-free native unwinder probe must pass before capture is enabled.",
       "coverage": "Active frame count out of eight, with an explicit unavailable message when native unwinder validation fails",
       "inspectorTab": "Stack",
-      "frameDisplay": "Frame index, address and live symbol, or saved address for an offline session",
+      "frameDisplay": "Frame index, address and session-scoped cached DbgHelp evidence; saved evidence works offline.",
       "emptyState": "Explains disabled capture or rejected and failed native capture"
+    },
+    "snapshotControls": {
+      "metadataOnly": true,
+      "pinnedBaselines": 1,
+      "retainedSnapshots": 4,
+      "timedSeconds": [1, 600],
+      "requiresActiveRecording": true,
+      "resumeOnOfflineLoad": false
     },
     "interactionValidation": {
       "desktopUI": "Real ImGui queued keyboard and mouse input",

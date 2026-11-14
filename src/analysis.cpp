@@ -255,13 +255,17 @@ void Model::prune() {
         auto victim = std::find_if(heaps.begin(), heaps.end(), [](const auto &p) { return p.second.dead; });
         if (victim == heaps.end())
             victim = heaps.begin();
+        const bool retired = victim->second.dead;
         heaps.erase(victim);
-        boundary();
+        history_truncated = true;
+        if (!retired)
+            boundary();
         ++evicted;
     }
     while (records.size() > limits.records) {
         auto victim = retired_records.empty() ? records.begin() : records.find(*retired_records.begin());
         auto id = victim->first;
+        const bool retired = victim->second.life == Life::freed;
         retired_records.erase(id);
         auto key = std::make_pair(victim->second.heap, victim->second.address);
         auto l = live.find(key);
@@ -274,7 +278,9 @@ void Model::prune() {
         watched.erase(id);
         records.erase(victim);
         ++evicted;
-        incomplete = true;
+        history_truncated = true;
+        if (!retired)
+            incomplete = true;
     }
 }
 void Model::rebuild_retention() {
@@ -375,6 +381,7 @@ Model Model::presentation() const {
     m.status = status;
     m.start_time = start_time;
     m.incomplete = incomplete;
+    m.history_truncated = history_truncated;
     m.recording = recording;
     m.connected = connected;
     m.offline = offline;
@@ -393,6 +400,8 @@ Model Model::presentation() const {
     m.regions = regions;
     m.findings = findings;
     m.snapshots = snapshots;
+    m.frame_symbols = frame_symbols;
+    m.snapshot_interval_ms = snapshot_interval_ms;
     m.watched = watched;
     return m;
 }
@@ -484,12 +493,57 @@ void Model::analyze() {
             findings.back().begin = r.previous_observed;
     }
 }
-Snapshot Model::snapshot(std::string name, uint64_t begin, uint64_t end) const {
+Snapshot Model::snapshot(std::string name, uint64_t begin, uint64_t end, SnapshotMode mode) const {
     Snapshot s{std::move(name), begin, end, session, incomplete, {}};
+    s.history_truncated = history_truncated;
+    s.mode = mode;
     s.records.reserve(records.size());
-    for (const auto &[_, a] : records)
-        s.records.push_back(a);
+    for (const auto &[_, a] : records) {
+        if (mode == SnapshotMode::metadata_only && a.life == Life::freed)
+            continue;
+        auto copy = a;
+        if (mode == SnapshotMode::metadata_only) {
+            copy.captures.clear();
+            copy.history.clear();
+        }
+        s.records.push_back(std::move(copy));
+    }
     return s;
+}
+void Model::add_snapshot(Snapshot snapshot) {
+    if (next_snapshot == UINT64_MAX)
+        throw std::runtime_error("Snapshot identity exhausted");
+    if (snapshot.pinned)
+        for (auto &s : snapshots)
+            s.pinned = false;
+    snapshot.id = next_snapshot++;
+    snapshots.push_back(std::move(snapshot));
+    if (snapshots.size() > 4) {
+        auto victim =
+            std::find_if(snapshots.begin(), snapshots.end(), [](const auto &s) { return !s.pinned; });
+        snapshots.erase(victim);
+    }
+}
+void Model::pin_snapshot(uint64_t id, bool pinned) {
+    auto found = std::find_if(snapshots.begin(), snapshots.end(), [=](const auto &s) { return s.id == id; });
+    if (found == snapshots.end())
+        throw std::invalid_argument("Snapshot is no longer retained");
+    if (pinned)
+        for (auto &s : snapshots)
+            s.pinned = false;
+    found->pinned = pinned;
+}
+std::string frame_label(const Model &model, uint64_t address) {
+    auto found = model.frame_symbols.find(address);
+    if (found == model.frame_symbols.end())
+        return model.offline || !model.connected ? "saved address; unresolved" : "resolving";
+    const auto &symbol = found->second;
+    if (symbol.quality == SymbolQuality::unresolved)
+        return "unresolved at lookup";
+    char offset[32]{};
+    sprintf_s(offset, "+0x%llX", symbol.quality == SymbolQuality::symbol ? symbol.displacement : symbol.rva);
+    return symbol.module + (symbol.quality == SymbolQuality::symbol ? "!" + symbol.name : "") + offset +
+           " [cached]";
 }
 std::vector<Difference> compare(const Snapshot &a, const Snapshot &b) {
     std::map<AllocationId, const Allocation *> left, right;
@@ -499,9 +553,14 @@ std::vector<Difference> compare(const Snapshot &a, const Snapshot &b) {
         right[x.id] = &x;
     std::vector<Difference> out;
     for (const auto &[id, r] : right) {
+        const auto it = left.find(id);
+        if (a.session == b.session && a.mode == SnapshotMode::metadata_only && it == left.end() &&
+            r->life == Life::freed && r->died && r->died < a.begin)
+            continue;
         Difference d{id, r->address, Change::added, {}};
-        auto it = left.find(id);
         if (a.session != b.session || a.incomplete || b.incomplete || r->life == Life::uncertain)
+            d.change = Change::uncertain;
+        else if (a.mode == SnapshotMode::metadata_only && it == left.end() && r->life == Life::freed)
             d.change = Change::uncertain;
         else if (it != left.end()) {
             const auto &l = *it->second;
@@ -534,7 +593,8 @@ std::vector<Difference> compare(const Snapshot &a, const Snapshot &b) {
         out.push_back(std::move(d));
     }
     for (const auto &[id, l] : left)
-        if (!right.contains(id))
+        if (!right.contains(id) &&
+            !(a.session == b.session && b.mode == SnapshotMode::metadata_only && l->life == Life::freed))
             out.push_back(
                 {id, l->address, Change::uncertain, {}}); // Absence may be retention eviction, not a free.
     return out;
