@@ -1,0 +1,55 @@
+{
+  "imgui": {
+    "version": "v1.91.9b-docking",
+    "repository": "https://github.com/ocornut/imgui",
+    "archive_sha256": "ca3471ed0c472b210fc37242e0b6338f37574f77f8bc1303befc040f0c22f06b",
+    "files": {
+      "third_party/imgui/backends/imgui_impl_dx11.cpp": "0e979ada341e809f2ab3423aca20fb30c65cc3e8eb4ead6095e2d7ed305026be",
+      "third_party/imgui/backends/imgui_impl_dx11.h": "e1fc506f6eb2d93230d95651f78e205be80aede764cb4ef60a1e726d6eb03f66",
+      "third_party/imgui/backends/imgui_impl_win32.cpp": "ed5f00e3a675324487ecdde14833968a3387855f953d6e18a157de6a2958ee05",
+      "third_party/imgui/backends/imgui_impl_win32.h": "10450c3ceee5cbae2a0dfe545c5f3a5026ff1e42999b097910f101f5400009b2",
+      "third_party/imgui/imconfig.h": "0884061cc43e27e1d346fe18dcd1425792eb2532d3d16610a82eb5ac751f7594",
+      "third_party/imgui/imgui.cpp": "2faf54df0db896fcb30b8e528e064f2c3227f2f695fe1c8fe62aa8b71f228084",
+      "third_party/imgui/imgui.h": "ea876e477f06f9619206284551638171c7ba4ed4dbc6ba67002e8f2e4ad7d3c7",
+      "third_party/imgui/imgui_draw.cpp": "8823f49f5c7a5181c0435a5fa01a03c3ff5bece283482b81001e71a66993f997",
+      "third_party/imgui/imgui_internal.h": "b6a9b40031c95c83d27595ce0b71f7e102d705ccac6bee6d03ff931fdd370569",
+      "third_party/imgui/imgui_tables.cpp": "4ea380fa9d49cac6cbfbc8b969969f9b0705518ec9ca340681d8c70e3eefbc28",
+      "third_party/imgui/imgui_widgets.cpp": "215eae588d52b455344ab5bd9847ab133d8bafff70841f992f7701b9fbda4dbc",
+      "third_party/imgui/imstb_rectpack.h": "2efa3d5f7d003c19743b15155dad9f46d9f9fc783a18893d703b431d3c990972",
+      "third_party/imgui/imstb_textedit.h": "77010e494caf72c178b573569612aec409d24380409676325a31d02de0ec64b7",
+      "third_party/imgui/imstb_truetype.h": "87f08919ae8e7223451d0e9d06b62829075d3e920c9e6ad436db9d7e7427ffce",
+      "third_party/imgui/LICENSE.txt": "c80c5789748d955c4a650562baa0d750494e2c7128c2ca66aaebe2e3c4e198bf"
+    }
+  },
+  "detours": {
+    "version": "v4.0.1",
+    "repository": "https://github.com/microsoft/Detours",
+    "archive_sha256": "5ab84eb08fb9befeb16ffd04ca283731b1e0e1e53b1947ce7868d4b9654e43fc",
+    "files": {
+      "third_party/detours/LICENSE.md": "b301808b732cfaa60df2b4b422d78cd97d2a15058b207e7e33f0535ba5170dd6",
+      "third_party/detours/src/creatwth.cpp": "062533627bfa775246948fad92f9f3c0ef7841cc1a83c15db9178be12f2dbf4f",
+      "third_party/detours/src/detours.cpp": "df415e05f985afe88f4b03ba34d6f5abce47edda11cd66d4f72902b801113eb7",
+      "third_party/detours/src/detours.h": "7b498657d8db4cff2d488b1e65cfeeb5b1305de7f32d23588b1fa86aaa46fcf7",
+      "third_party/detours/src/detver.h": "1324bbf731d202a37d2f9874279e1b5e2e47118c62662c0372208d4a88342549",
+      "third_party/detours/src/disasm.cpp": "6c44283ac6987d77d92aca93a6a8e9f0dc1f7caf8a2b310e4b374853e9136236",
+      "third_party/detours/src/disolarm.cpp": "20900e34f4afa968f4182fc9ae2d94d00ad15ddf1a17c53a034b18b38a9a4592",
+      "third_party/detours/src/disolarm64.cpp": "b93f39ba5691b9ffb98aae45c7fa5f5a6975a8fed001704ec97f7867a59998ce",
+      "third_party/detours/src/disolia64.cpp": "8ce93f70257c11a7b1015fac5ff801e7b72bbb9621f302a74f9d0bc1db49d334",
+      "third_party/detours/src/disolx64.cpp": "dcac45e9bf07b916e454e141f850856b76e3e0f7b502bd5dd56e18aa2250e020",
+      "third_party/detours/src/disolx86.cpp": "045d4b00029e810a9a156c1e17b33c2becdda1cc652a7cadfe61d9d1c66c81b6",
+      "third_party/detours/src/image.cpp": "8e7c94b335237565f3dce14b6dfd9dd88876cf10fb55b9c910f12ae9c38bd190",
+      "third_party/detours/src/Makefile": "0071c68d96a6adafa7b1e6d24a0640f19ca76a91aa8de7116c943d4405db6e84",
+      "third_party/detours/src/modules.cpp": "4a3f970eb539a4379996eb17e14bd75902fe4f34d566cfd19682ff19315cbc6f",
+      "third_party/detours/src/uimports.cpp": "2b2d92df4c5412906d7e6830a7c2836d78e368a6bef509be028566cbd921e83b"
+    }
+  },
+  "json": {
+    "version": "v3.11.3",
+    "repository": "https://github.com/nlohmann/json",
+    "archive_sha256": "04022b05d806eb5ff73023c280b68697d12b93e1b7267a0b22a1a39ec7578069",
+    "files": {
+      "third_party/json/LICENSE.MIT": "86b998c792894ccb911a1cb7994f7a9652894e7a094c0b5e45be2f553f45cf14",
+      "third_party/json/single_include/nlohmann/json.hpp": "9bea4c8066ef4a1c206b2be5a36302f8926f7fdc6087af5d20b417d0cf103ea6"
+    }
+  }
+}

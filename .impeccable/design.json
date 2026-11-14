@@ -1,0 +1,109 @@
+{
+  "schemaVersion": 2,
+  "title": "Heapglass desktop design",
+  "extensions": {
+    "platform": {
+      "operatingSystem": "Windows 11 x64",
+      "windowing": "Win32",
+      "interface": "Dear ImGui docking",
+      "renderer": "Direct3D 11",
+      "keyboardNavigation": true,
+      "layoutPersistence": "%LOCALAPPDATA%/Heapglass/layout.ini"
+    },
+    "colors": {
+      "encoding": "Normalized RGBA, matching ImVec4 source values",
+      "baseStyle": "ImGui::StyleColorsDark",
+      "windowBackground": [0.055, 0.070, 0.085, 1],
+      "childBackground": [0.055, 0.070, 0.085, 1],
+      "text": [0.88, 0.92, 0.94, 1],
+      "disabledText": [0.58, 0.65, 0.70, 1],
+      "mutedText": [0.60, 0.68, 0.73, 1],
+      "heading": [0.44, 0.84, 0.80, 1],
+      "checkmark": [0.38, 0.83, 0.78, 1],
+      "header": [0.12, 0.26, 0.29, 1],
+      "headerHovered": [0.17, 0.34, 0.37, 1],
+      "headerActive": [0.18, 0.40, 0.43, 1],
+      "button": [0.13, 0.26, 0.29, 1],
+      "buttonHovered": [0.17, 0.36, 0.39, 1],
+      "tabSelected": [0.13, 0.28, 0.31, 1],
+      "tabSelectedOverline": [0.38, 0.83, 0.78, 1],
+      "incompleteHistory": [1, 0.74, 0.37, 1],
+      "completeHistory": [0.44, 0.84, 0.80, 1]
+    },
+    "typography": {
+      "body": {
+        "family": "Segoe UI",
+        "file": "%WINDIR%/Fonts/segoeui.ttf",
+        "logicalPixelSize": 15,
+        "usage": "Menus, panel titles, controls, tables and evidence text"
+      },
+      "hex": {
+        "family": "Consolas",
+        "file": "%WINDIR%/Fonts/consola.ttf",
+        "logicalPixelSize": 14,
+        "usage": "Inspector Hex + ASCII read-only text field"
+      },
+      "dpi": "Font atlas sizes multiply the logical pixel sizes by initial window DPI. WM_DPICHANGED adjusts FontGlobalScale relative to that initial DPI."
+    },
+    "spacing": {
+      "unit": "Logical pixels before initial DPI scaling",
+      "windowPadding": [12, 10],
+      "itemSpacing": [8, 6],
+      "initialization": "Window padding and item spacing are assigned before ScaleAllSizes(initial DPI). Other spacing uses the scaled ImGui defaults.",
+      "dpiChanges": "WM_DPICHANGED scales current style sizes by new DPI divided by the previous style DPI."
+    },
+    "radius": {
+      "unit": "Logical pixels before initial DPI scaling",
+      "window": 0,
+      "frame": 3,
+      "grab": 3,
+      "initialization": "Explicit rounding values are assigned before ScaleAllSizes(initial DPI). Other radii use the scaled ImGui defaults."
+    },
+    "layout": {
+      "container": "DockSpaceOverViewport on the main Win32 viewport",
+      "menu": "Main menu bar with session actions, recording, display pause, sampling, limits, state and frame rate",
+      "initialSplits": [
+        { "direction": "left", "fractionOfRemainingNode": 0.16, "panel": "Session & navigation" },
+        { "direction": "right", "fractionOfRemainingNode": 0.38, "panel": "Inspector" },
+        { "direction": "down", "fractionOfRemainingNode": 0.32, "panel": "Investigation" }
+      ],
+      "remainingPanel": "Allocations & memory map",
+      "panels": [
+        {
+          "name": "Session & navigation",
+          "position": "left",
+          "contents": "Process identity, coverage, snapshots, allocation and memory-map navigation, status"
+        },
+        {
+          "name": "Allocations & memory map",
+          "position": "center",
+          "contents": "Filtered allocation table or committed process-memory region table"
+        },
+        {
+          "name": "Inspector",
+          "position": "right",
+          "contents": "Selected allocation identity and sampled content, or selected memory region and evidence"
+        },
+        {
+          "name": "Investigation",
+          "position": "below the center panel",
+          "tabs": ["Events", "All strings", "Findings", "Compare snapshots"]
+        }
+      ],
+      "tableBehavior": "Allocation and region tables clip rows, scroll horizontally and vertically, and freeze their first column and header row."
+    }
+  },
+  "components": [
+    { "name": "Docked panel", "kind": "custom", "description": "Native ImGui window in a persistent four-panel dock layout." },
+    { "name": "Allocation and region tables", "kind": "custom", "description": "Resizable native ImGui tables with alternating rows, frozen headers and selectable records." },
+    { "name": "Inspector hex field", "kind": "input", "description": "Read-only multiline Consolas field inside a horizontally scrollable child window, with selectable offsets, bytes and ASCII." },
+    { "name": "Navigation row", "kind": "nav", "description": "ImGui selectable for all allocations, the process memory map, heaps and snapshots." },
+    { "name": "Action button", "kind": "button", "description": "ImGui button with teal default and hover fills, using the explicit frame radius." }
+  ],
+  "narrative": {
+    "overview": "The native interface prioritizes dense tables and inspectable evidence. Its layout uses four dockable panels. Session controls stay in the main menu, and the Inspector remains visible beside the allocation table or memory map.",
+    "rules": [
+      { "name": "State text", "body": "State text accompanies color.", "section": "colors" }
+    ]
+  }
+}

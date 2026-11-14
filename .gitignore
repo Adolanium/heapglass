@@ -1,0 +1,12 @@
+/build*/
+/deps/
+/out/
+*.user
+Heapglass.ini
+*.hgs.json
+*.groundtruth.jsonl
+
+*.ui-profile.json
+Heapglass.allocations.png
+Heapglass.memory-map.png
+capture-error.txt
