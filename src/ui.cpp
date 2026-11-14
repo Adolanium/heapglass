@@ -85,7 +85,8 @@ void UI::draw() {
         if (shown && shown->session != next->session) {
             site_filter.reset();
             selected = region_selected = 0;
-            inspecting_snapshot = capture_index = -1;
+            inspecting_snapshot_id = 0;
+            capture_index = -1;
         }
         shown = std::move(next);
     }
@@ -135,8 +136,13 @@ void UI::menu() {
         ImGui::Separator();
         if (ImGui::MenuItem("Open saved session...")) {
             auto p = choose_file(false, L"Heapglass session\0*.json\0All files\0*.*\0", L"json");
-            if (!p.empty())
+            if (!p.empty()) {
+                display_paused = false;
+                select_allocation(0);
+                region_selected = 0;
+                site_filter.reset();
                 controller.load(p);
+            }
         }
         ImGui::MenuItem("Include sampled bytes in JSON", nullptr, &include_bytes);
         if (ImGui::MenuItem("Save session / export JSON...")) {
@@ -209,7 +215,9 @@ void UI::sidebar() {
         ImGui::Text("Queued target: %llu", shown->transport_pending);
         ImGui::Text("Queued analysis: %llu", shown->analysis_pending);
         ImGui::TextColored(shown->incomplete ? ImVec4(1, .74f, .37f, 1) : ImVec4(.44f, .84f, .8f, 1), "%s",
-                           shown->incomplete ? "INCOMPLETE HISTORY" : "No reported event loss");
+                           shown->incomplete ? "ALLOCATION COVERAGE INCOMPLETE" : "No reported event loss");
+        if (shown->history_truncated)
+            muted("Older record history evicted");
         ImGui::Text("Sample: %u ms / %zu bytes", shown->limits.sample_ms, shown->limits.per_allocation);
         ImGui::Text("Retained: %.1f / %.0f MiB", double(shown->retained_bytes) / 1048576.,
                     double(shown->limits.per_session) / 1048576.);
@@ -226,16 +234,40 @@ void UI::sidebar() {
         heading("Snapshots");
         ImGui::SetNextItemWidth(-1);
         ImGui::InputText("##snapshot-name", snapshot_name, sizeof(snapshot_name));
+        ImGui::Checkbox("Metadata-only snapshot", &metadata_snapshots);
+        ImGui::BeginDisabled(!shown->connected || !shown->recording);
         if (ImGui::Button("Capture named snapshot", ImVec2(-1, 0)))
-            controller.take_snapshot(snapshot_name);
+            controller.take_snapshot(snapshot_name, metadata_snapshots ? SnapshotMode::metadata_only
+                                                                       : SnapshotMode::with_content);
+        bool timed = shown->snapshot_interval_ms != 0;
+        if (timed)
+            timed_seconds = int(shown->snapshot_interval_ms / 1000);
+        ImGui::BeginDisabled(timed);
+        ImGui::SetNextItemWidth(70);
+        ImGui::SliderInt("Timed interval (s)", &timed_seconds, 1, 600);
+        ImGui::EndDisabled();
+        if (ImGui::Checkbox("Timed metadata snapshots", &timed))
+            controller.schedule_snapshots(timed ? unsigned(timed_seconds) * 1000 : 0);
+        ImGui::EndDisabled();
+        if (shown->snapshot_interval_ms)
+            ImGui::Text("Observing every %u s", shown->snapshot_interval_ms / 1000);
         for (size_t i = 0; i < shown->snapshots.size(); ++i) {
             ImGui::PushID(int(i));
-            if (ImGui::Selectable(shown->snapshots[i].name.c_str(), snap_b == int(i)))
+            const auto &snapshot = shown->snapshots[i];
+            auto label = snapshot.name + (snapshot.pinned ? " [baseline]" : "");
+            if (ImGui::Selectable(label.c_str(), snap_b == int(i), 0,
+                                  ImVec2(ImGui::GetContentRegionAvail().x - 55, 0)))
                 snap_b = int(i);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%zu / %zu records sampled in acquisition interval; other captures retain "
                                   "their original times",
                                   acquired(shown->snapshots[i]), shown->snapshots[i].records.size());
+            ImGui::SameLine();
+            if (ImGui::SmallButton(snapshot.pinned ? "Unpin" : "Pin"))
+                controller.pin_snapshot(snapshot.id, !snapshot.pinned);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Keep one baseline while newer observations roll. Metadata snapshots omit "
+                                  "bytes and freed records.");
             ImGui::PopID();
         }
         heading("Navigate");
@@ -521,7 +553,7 @@ void UI::select_allocation(uint64_t generation, int capture) {
     capture_index = capture;
     region_selected = 0;
     regions_view = false;
-    inspecting_snapshot = -1;
+    inspecting_snapshot_id = 0;
 }
 void UI::navigate(uint64_t address, uint64_t heap, uint64_t at) {
     uint64_t best = 0;
@@ -567,8 +599,16 @@ void UI::details() {
                 return;
             }
     const Allocation *inspected = nullptr;
-    if (inspecting_snapshot >= 0 && inspecting_snapshot < int(shown->snapshots.size())) {
-        const auto &snapshot = shown->snapshots[inspecting_snapshot];
+    if (inspecting_snapshot_id) {
+        const auto found = std::find_if(shown->snapshots.begin(), shown->snapshots.end(),
+                                        [&](const auto &s) { return s.id == inspecting_snapshot_id; });
+        if (found == shown->snapshots.end()) {
+            empty("Snapshot is no longer retained", "Select a current record or a retained snapshot. Pin a "
+                                                    "baseline to keep it while observations roll.");
+            ImGui::End();
+            return;
+        }
+        const auto &snapshot = *found;
         for (const auto &a : snapshot.records)
             if (a.id.generation == selected) {
                 inspected = &a;
@@ -592,7 +632,8 @@ void UI::details() {
     if (a.parent)
         ImGui::Text("Reallocated from generation %llu", a.parent);
     ImGui::Text("Thread %u | heap %s", a.thread, hex_address(a.heap).c_str());
-    ImGui::TextWrapped("Caller %s | %s", hex_address(a.caller).c_str(), controller.symbol(a.caller).c_str());
+    ImGui::TextWrapped("Caller %s | %s", hex_address(a.caller).c_str(),
+                       frame_label(*shown, a.caller).c_str());
     if (age(a, *shown) >= 0)
         ImGui::Text("Lifetime %.6f s", age(a, *shown));
     else
@@ -691,7 +732,7 @@ void UI::details() {
                               : "No stack was captured. Enable up to eight frames under Limits & rules.");
             for (uint32_t n = 0; n < a.stack_count; ++n)
                 ImGui::TextWrapped("%u  %s  %s", n, hex_address(a.stack[n]).c_str(),
-                                   shown->offline ? "saved address" : controller.symbol(a.stack[n]).c_str());
+                                   frame_label(*shown, a.stack[n]).c_str());
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("History")) {
@@ -866,11 +907,12 @@ void UI::bottom() {
                                             " differing captured bytes";
                         if (ImGui::Selectable(label.c_str())) {
                             select_allocation(d.id.generation);
-                            inspecting_snapshot =
+                            const auto snapshot_index =
                                 std::any_of(b.records.begin(), b.records.end(),
                                             [&](const Allocation &r) { return r.id == d.id; })
                                     ? snap_b
                                     : snap_a;
+                            inspecting_snapshot_id = shown->snapshots[snapshot_index].id;
                         }
                         if (ImGui::IsItemHovered() && !d.byte_offsets.empty()) {
                             ImGui::BeginTooltip();
@@ -911,9 +953,21 @@ void UI::site_tooltip(const AllocationSite &site) {
         return;
     ImGui::BeginTooltip();
     ImGui::TextUnformatted(site_source(site));
-    for (auto address : site_frames(site))
-        ImGui::Text("%s  %s", hex_address(address).c_str(),
-                    shown->offline ? "saved address" : controller.symbol(address).c_str());
+    for (auto address : site_frames(site)) {
+        ImGui::Text("%s  %s", hex_address(address).c_str(), frame_label(*shown, address).c_str());
+        const auto found = shown->frame_symbols.find(address);
+        if (found != shown->frame_symbols.end() && found->second.quality != SymbolQuality::unresolved) {
+            const auto &s = found->second;
+            ImGui::Text("RVA %llX | image %u bytes | PE timestamp %08X | checksum %08X", s.rva, s.image_size,
+                        s.timestamp, s.checksum);
+            char guid[33]{};
+            for (size_t i = 0; i < s.pdb_guid.size(); ++i)
+                sprintf_s(guid + i * 2, 3, "%02x", unsigned(s.pdb_guid[i]));
+            ImGui::Text("PDB identity %s | age %u | lookup QPC %llu", guid, s.pdb_age, s.resolved_at);
+            ImGui::TextWrapped("%s", s.image_path.c_str());
+        }
+    }
+    ImGui::TextUnformatted("Cached module evidence; lookup time is not an event-time module lifetime check.");
     ImGui::EndTooltip();
 }
 void UI::allocation_sites() {
@@ -1027,7 +1081,7 @@ void UI::snapshot_growth() {
                     for (size_t s = 0; s < shown->snapshots.size(); ++s)
                         if ((final && shown->snapshots[s].end == report.end) ||
                             (!final && shown->snapshots[s].begin == report.begin)) {
-                            inspecting_snapshot = int(s);
+                            inspecting_snapshot_id = shown->snapshots[s].id;
                             break;
                         }
                 }
@@ -1131,40 +1185,35 @@ void UI::dialogs() {
         ImGui::EndPopup();
     }
     if (show_limits) {
+        limits_draft = shown->limits;
         ImGui::OpenPopup("Sampling limits & rules");
         show_limits = false;
     }
     if (ImGui::BeginPopupModal("Sampling limits & rules", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        static Limits l;
-        static int bytes = 4096, scan = 1024, session = 32, interval = 1000, minimum = 4;
-        static float threshold = 7.2f, fraction = .35f, delta = 1.5f;
-        static int retention = 0, stack_frames = 0;
-        ImGui::InputInt("Bytes per allocation", &bytes);
-        ImGui::InputInt("KiB per scan", &scan);
-        ImGui::InputInt("MiB retained live bytes", &session);
-        ImGui::InputInt("Sample interval ms", &interval);
-        ImGui::InputInt("Minimum string characters", &minimum);
+        auto &l = limits_draft;
+        int retention = int(l.retention), stack_frames = int(l.stack_frames);
+        ImGui::InputScalar("Bytes per allocation", ImGuiDataType_U64, &l.per_allocation);
+        ImGui::InputScalar("Bytes per scan", ImGuiDataType_U64, &l.per_scan);
+        ImGui::InputScalar("Bytes retained", ImGuiDataType_U64, &l.per_session);
+        ImGui::Text("%.2f MiB retained budget", double(l.per_session) / 1048576.);
+        ImGui::InputScalar("Sample interval ms", ImGuiDataType_U32, &l.sample_ms);
+        ImGui::InputScalar("Minimum string characters", ImGuiDataType_U64, &l.min_string);
         const char *retention_modes[] = {"Rolling oldest samples", "Stop at capacity"};
-        ImGui::Combo("Retention policy", &retention, retention_modes, 2);
-        ImGui::SliderInt("Optional stack frames", &stack_frames, 0, max_stack_frames);
+        if (ImGui::Combo("Retention policy", &retention, retention_modes, 2))
+            l.retention = static_cast<Retention>(retention);
+        if (ImGui::SliderInt("Optional stack frames", &stack_frames, 0, max_stack_frames))
+            l.stack_frames = unsigned(stack_frames);
         ImGui::TextWrapped("Stack capture is disabled by default. Enabling it requires the target agent's "
                            "allocation-free native unwinder probe to pass and adds per-call work.");
-        ImGui::SliderFloat("High entropy bits/byte", &threshold, 0, 8);
-        ImGui::SliderFloat("Changed fraction", &fraction, 0, 1);
-        ImGui::SliderFloat("Entropy delta", &delta, 0, 8);
+        const double zero = 0, one = 1, eight = 8;
+        ImGui::SliderScalar("High entropy bits/byte", ImGuiDataType_Double, &l.high_entropy, &zero, &eight,
+                            "%.2f");
+        ImGui::SliderScalar("Changed fraction", ImGuiDataType_Double, &l.changed_fraction, &zero, &one,
+                            "%.2f");
+        ImGui::SliderScalar("Entropy delta", ImGuiDataType_Double, &l.entropy_change, &zero, &eight, "%.2f");
         muted("At most 50,000 allocations, 10,000 events, 8 captures per record.");
         muted("At most 4 snapshots, each retains up to 8 MiB of bytes.");
         if (ImGui::Button("Apply")) {
-            l.per_allocation = size_t(std::max(0, bytes));
-            l.per_scan = size_t(std::max(0, scan)) * 1024;
-            l.per_session = size_t(std::max(0, session)) * 1048576;
-            l.sample_ms = unsigned(std::max(0, interval));
-            l.min_string = size_t(std::max(0, minimum));
-            l.retention = static_cast<Retention>(retention);
-            l.stack_frames = static_cast<unsigned>(stack_frames);
-            l.high_entropy = threshold;
-            l.changed_fraction = fraction;
-            l.entropy_change = delta;
             controller.configure(l);
             ImGui::CloseCurrentPopup();
         }

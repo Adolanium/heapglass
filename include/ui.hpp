@@ -27,8 +27,11 @@ class UI {
         auto operator<=>(const Filter &) const = default;
     };
     uint64_t heap_filter = 0, min_address = 0, max_address = UINT64_MAX, min_size = 0, max_size = UINT64_MAX;
-    int state_filter = 0, thread_filter = 0, min_lifetime = 0, capture_index = -1, snap_a = 0, snap_b = 1,
-        inspecting_snapshot = -1;
+    int state_filter = 0, thread_filter = 0, min_lifetime = 0, capture_index = -1, snap_a = 0, snap_b = 1;
+    uint64_t inspecting_snapshot_id{};
+    Limits limits_draft;
+    bool metadata_snapshots = false;
+    int timed_seconds = 10;
     float entropy_filter = 0;
     char search[256]{}, permission_filter[32]{}, finding_filter[128]{},
         snapshot_name[128] = "Snapshot", launch_path[1024]{}, launch_args[1024]{}, launch_cwd[1024]{};

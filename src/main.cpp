@@ -228,13 +228,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR command_line, int) {
                 error << e.what();
             }
             if (capture_stage == 0) {
-                app.controller.take_snapshot("Capture A");
+                app.controller.schedule_snapshots(4000);
                 app.show_memory_map();
             } else if (capture_stage == 1) {
-                app.controller.take_snapshot("Capture B");
                 app.show_allocation_stack();
             } else if (capture_stage == 2) {
-                app.controller.take_snapshot("Capture C");
                 app.show_allocation_sites();
             } else if (capture_stage == 3)
                 app.show_snapshot_growth();

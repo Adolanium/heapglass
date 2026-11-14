@@ -4,23 +4,26 @@ Validation ran on November 14, 2026, on Windows 11 Pro 10.0.26200, an Intel Core
 
 ## Native tests
 
-All application targets compile as C++20 x64 Release binaries. Reproduce the build and ten CTest groups with:
+All application targets compile as C++20 x64 Release binaries. Reproduce the build and eleven CTest groups with:
 
 ```powershell
 cmake --build build --config Release --parallel 8
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-The full local version 0.3 run passed all ten groups in 55.49 seconds. Focused follow-up checks cover programmatic tab selection, group filtering, historical navigation, and exported reports. Stack and History remain accessible for allocations with no captured bytes.
+Version 0.4 adds the profiling-workflow group to the ten existing groups. Focused checks cover retention coverage, snapshot cutoffs and acknowledged losses, mixed snapshot populations, recording stop during baseline acquisition, pinned baselines, offline symbol isolation, Unicode symbol round trips, and settings apply/cancel behavior. Stack and History remain accessible for allocations with no captured bytes.
+
+The final local Release run passed all eleven groups in 69.22 seconds. The paired sustained run is reported separately below.
 
 | Group | Exercised behavior |
 | --- | --- |
 | strings | ASCII, validated UTF-8, both UTF-16LE alignments, multilingual starts, surrogate pairs, exact offsets, malformed input, scalar minimum lengths, rejected controls and private use |
 | retention | Rolling byte eviction, stop-at-capacity status, immutable presentation bytes, immediate budget reduction, bounded record eviction after event loss |
 | allocation-profiles | Full bounded-stack and caller-only grouping, live/freed/uncertain totals, offline age provenance, repeated growth, generation-based survivors, uncertain intervals, session mismatch, overflow, CSV escaping, and saved-session reconstruction |
+| profiling-workflow | Four-thread native workload with stacks, verified metadata cutoffs, independent retained-buffer growth, pinned rolling observations, save/load during capture, stop/exit scheduling, cached module evidence checked against the target PE file, and a controlled backlog probe |
 | collector-handoff | A latch pauses the actual source-to-inbox transfer. The source remains non-idle until destination publication; the transferred free retains its literal address and result |
 | bounded-stacks | Eight-frame native capture, committed frame addresses, settings toggles, saved stacks, and forced allocator reentry that disables capture, counts loss, and leaves the target operational |
-| core | Allocation/reallocation/free semantics, heap generations, delayed reuse, uncertain lifetimes, recording watermarks, transport reservations, concurrent producers, forced overflow, snapshots, findings, session formats 1 and 2, malformed imports, and CSV neutralization |
+| core | Allocation/reallocation/free semantics, heap generations, delayed reuse, uncertain lifetimes, recording watermarks, transport reservations, concurrent producers, forced overflow, snapshots, findings, legacy session import, malformed data, and CSV neutralization |
 | live | Real injection, independently logged fixture address and API semantics, caller last-error and exception behavior, exact multilingual strings, executable pages, snapshots, save/load, recording gaps, disconnect, resident reattach, overflow, and target exit |
 | desktop-ui | Real queued ImGui input for filtering and clearing, ascending/descending size sorting, allocation/string/snapshot navigation, site filtering and clearing, profile-tab selection, repeated-growth evidence, report exports, keyboard focus traversal, and dock splitter dragging |
 | native-dialogs-dpi | Real Unicode Open/Save selection and cancellation on an unshown private Windows desktop, TEMP cleanup, and synthetic WM_DPICHANGED at 100/150/200 percent and back to 100 percent |
@@ -31,6 +34,12 @@ Failure tests create their own processes and mappings. Crash validation terminat
 The fixture also produces compressed and seeded random buffers, CNG AES changes, multiple heaps, concurrent threads, failed and in-place reallocations, heap destruction, and sampled protection transitions. Not every fixture branch has an independent live assertion. No tests send global desktop input or switch the user's input desktop.
 
 Two concurrency regressions have dedicated coverage. A paused collector must not make both queues appear empty before publication. Delayed operations from an earlier recording interval must not receive newly certain birth times. Allocation eviction uses an ordered retirement index so overflow recovery does not repeatedly scan every retained uncertain record.
+
+The cutoff tests also require newly completed event loss to be acknowledged even when the operation clock and both queues appear quiet. Metadata cutoffs are rejected while backlog or unpublished operations remain. A timed schedule must not restart after recording stops during baseline acquisition.
+
+## Sustained workflow
+
+The [paired sustained measurement](sustained-validation.md) adds a two-minute baseline and two-minute instrumented workload with four threads, eight-frame stacks, a pinned baseline, timed metadata observations, and saving during capture. It observed 577,051 events without loss, verified the retained-buffer growth against independent truth, and recorded sample attribution, queue lag, CPU, and memory behavior. See [raw results](sustained.json). The short CI variant exercises the same workflow without adding four minutes to every build.
 
 ## Instrumentation benchmark
 
@@ -60,11 +69,13 @@ These are short microbenchmarks on a shared desktop, not isolated laboratory mea
 
 ## Desktop evidence
 
-The PNGs under [screenshots](screenshots) are actual DX11 back-buffer captures against the controlled target. They contain no fabricated rows. The capture run explicitly enables eight stack frames and exports allocations, the separate process memory map, the Stack tab, allocation sites, and snapshot growth after acquiring three real snapshots. Raw CPU draw-time and frame-time values are in [ui-profile.json](ui-profile.json). Draw time measures interface construction, not GPU execution or end-to-end input latency.
+The PNGs under [screenshots](screenshots) are actual DX11 back-buffer captures against the controlled target. They contain no fabricated rows. The capture run explicitly enables eight stack frames, pins a metadata baseline, and acquires timed observations. It exports allocations, the separate process memory map, the Stack tab, allocation sites, and snapshot growth. Raw CPU draw-time and frame-time values are in [ui-profile.json](ui-profile.json). Draw time measures interface construction, not GPU execution or end-to-end input latency.
 
 See the [allocation view](screenshots/allocations.png), [memory map](screenshots/memory-map.png), [stack view](screenshots/stack.png), [allocation sites](screenshots/sites.png), and [snapshot growth](screenshots/growth.png). Growth in this fixture is not an independently verified leak; deterministic positive and uncertainty cases are covered by the profiling tests.
 
-The final hidden-window run measured 2,547 frames after warmup, mean CPU draw time 1.73 ms, p95 2.90 ms, maximum 31.25 ms, and mean frame time including presentation 8.87 ms. Hidden-window presentation timing is not a visible-window refresh-rate guarantee.
+Hidden-window presentation timing is not a visible-window refresh-rate guarantee.
+
+The final capture measured 3,319 frames after warmup, mean CPU draw time 1.39 ms, p95 2.30 ms, maximum 19.94 ms, and mean frame time including presentation 6.93 ms.
 
 Native interaction tests use an offscreen ImGui context and an unshown private desktop. They establish the documented gestures and dialog behavior without physical desktop interaction. Synthetic DPI messages validate the shared application handler, suggested window bounds, font scaling, and style scaling. They do not establish physical multi-monitor behavior.
 

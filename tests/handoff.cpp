@@ -48,6 +48,15 @@ int main() {
         CHECK(destination.op == Op::free);
         CHECK(destination.previous == 0x2000);
         CHECK(destination.result == 1);
+        const auto quiet_clock = atomic_read(&shared->clock);
+        CHECK(transport_quiet(shared, 0, 0));
+        dropped(shared); // Loss completes after consumer accounting, before the first cutoff clock read.
+        CHECK(atomic_read(&shared->clock) == quiet_clock);
+        CHECK(transport_quiet(shared));
+        CHECK(!transport_quiet(shared, 0, 0));
+        CHECK(transport_quiet(shared, 1, 0));
+        CHECK(!transport_quiet(shared, 1, 1));
+        CHECK(transport_quiet(shared, 2, 1));
         InterlockedIncrement64(&shared->unbuffered_active);
         CHECK(!transport_quiet(shared));
         InterlockedDecrement64(&shared->unbuffered_active);

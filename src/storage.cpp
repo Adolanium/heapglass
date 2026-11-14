@@ -208,13 +208,34 @@ static Allocation parse_allocation(const J &j, size_t &budget, uint64_t session)
     }
     return a;
 }
+static J symbol_json(uint64_t address, const FrameSymbol &s) {
+    std::vector<uint8_t> guid(s.pdb_guid.begin(), s.pdb_guid.end());
+    return {{"address", address},
+            {"quality", uint32_t(s.quality)},
+            {"module", s.module},
+            {"image_path", s.image_path},
+            {"name", s.name},
+            {"rva", s.rva},
+            {"displacement", s.displacement},
+            {"resolved_at", s.resolved_at},
+            {"image_size", s.image_size},
+            {"timestamp", s.timestamp},
+            {"checksum", s.checksum},
+            {"pdb_age", s.pdb_age},
+            {"pdb_guid", hex(guid)},
+            {"source", "DbgHelp cached module evidence"}};
+}
 void save_session(const Model &m, const std::wstring &path, bool bytes) {
-    J j = {{"format", "heapglass-session"}, {"version", 2},          {"session", m.session},
+    J j = {{"format", "heapglass-session"}, {"version", 3},          {"session", m.session},
            {"frequency", m.frequency},      {"started", m.started},  {"pid", m.pid},
            {"creation", m.creation},        {"process", m.process},  {"start_time", m.start_time},
            {"incomplete", m.incomplete},    {"dropped", m.dropped},  {"observed", m.observed},
            {"evicted", m.evicted},          {"records", J::array()}, {"snapshots", J::array()},
            {"regions", J::array()},         {"events", J::array()}};
+    j["history_truncated"] = m.history_truncated;
+    j["frame_symbols"] = J::array();
+    for (const auto &[address, s] : m.frame_symbols)
+        j["frame_symbols"].push_back(symbol_json(address, s));
     j["limits"] = {{"per_allocation", m.limits.per_allocation},
                    {"per_scan", m.limits.per_scan},
                    {"per_session", m.limits.per_session},
@@ -230,9 +251,16 @@ void save_session(const Model &m, const std::wstring &path, bool bytes) {
     j["sampling_budget_exhausted"] = m.sampling_budget_exhausted;
     for (const auto &[_, a] : m.records)
         j["records"].push_back(allocation_json(a, bytes));
+    uint64_t next_id = 1;
+    for (const auto &s : m.snapshots)
+        next_id = std::max(next_id, s.id + 1);
     for (const auto &s : m.snapshots) {
         J v = {{"name", s.name},       {"begin", s.begin},           {"end", s.end},
                {"session", s.session}, {"incomplete", s.incomplete}, {"records", J::array()}};
+        v["id"] = s.id ? s.id : next_id++;
+        v["history_truncated"] = s.history_truncated;
+        v["pinned"] = s.pinned;
+        v["mode"] = uint32_t(s.mode);
         for (const auto &a : s.records)
             v["records"].push_back(allocation_json(a, bytes));
         j["snapshots"].push_back(std::move(v));
@@ -306,7 +334,7 @@ Model load_session(const std::wstring &path) {
         return true;
     });
     if (text(j, "format", 64) != "heapglass-session" ||
-        (number(j, "version") != 1 && number(j, "version") != 2))
+        (number(j, "version") < 1 || number(j, "version") > 3))
         throw std::runtime_error("Unsupported session format/version");
     Model m;
     m.offline = true;
@@ -324,6 +352,44 @@ Model load_session(const std::wstring &path) {
     m.dropped = number(j, "dropped");
     m.observed = number(j, "observed");
     m.evicted = number(j, "evicted");
+    m.history_truncated =
+        j.contains("history_truncated") ? j.at("history_truncated").get<bool>() : m.evicted != 0;
+    if (j.contains("frame_symbols")) {
+        const auto &symbols = j.at("frame_symbols");
+        if (!symbols.is_array() || symbols.size() > 10000)
+            throw std::runtime_error("Saved symbol limit exceeded");
+        for (const auto &v : symbols) {
+            const auto address = number(v, "address"), quality = number(v, "quality");
+            FrameSymbol s;
+            if (!address || quality > 2)
+                throw std::runtime_error("Invalid saved frame identity");
+            s.quality = static_cast<SymbolQuality>(quality);
+            s.module = text(v, "module", 256);
+            s.image_path = text(v, "image_path");
+            s.name = text(v, "name", 8192);
+            s.rva = number(v, "rva");
+            s.displacement = number(v, "displacement");
+            s.resolved_at = number(v, "resolved_at");
+            auto image_size = number(v, "image_size"), timestamp = number(v, "timestamp"),
+                 checksum = number(v, "checksum"), age = number(v, "pdb_age");
+            if (image_size > MAXDWORD || timestamp > MAXDWORD || checksum > MAXDWORD || age > MAXDWORD ||
+                s.rva > address || (quality && (!image_size || s.rva >= image_size || s.module.empty())) ||
+                (quality == 2 && (s.name.empty() || s.displacement > s.rva)) ||
+                (!quality && (!s.module.empty() || !s.name.empty() || s.rva || s.displacement || image_size)))
+                throw std::runtime_error("Invalid saved module or symbol range");
+            s.image_size = static_cast<uint32_t>(image_size);
+            s.timestamp = static_cast<uint32_t>(timestamp);
+            s.checksum = static_cast<uint32_t>(checksum);
+            s.pdb_age = static_cast<uint32_t>(age);
+            size_t guid_budget = 16;
+            auto guid = unhex(text(v, "pdb_guid", 32), guid_budget);
+            if (guid.size() != 16 || text(v, "source", 128) != "DbgHelp cached module evidence")
+                throw std::runtime_error("Invalid saved symbol provenance");
+            std::copy(guid.begin(), guid.end(), s.pdb_guid.begin());
+            if (!m.frame_symbols.emplace(address, std::move(s)).second)
+                throw std::runtime_error("Duplicate saved frame identity");
+        }
+    }
     if (j.contains("evicted_captures")) {
         m.evicted_captures = number(j, "evicted_captures");
         m.skipped_captures = number(j, "skipped_captures");
@@ -364,6 +430,8 @@ Model load_session(const std::wstring &path) {
         m.next_generation = std::max(m.next_generation, id + 1);
     }
     size_t total_records = m.records.size();
+    std::set<uint64_t> snapshot_ids;
+    size_t pinned_count = 0;
     for (const auto &v : j.at("snapshots")) {
         Snapshot s{text(v, "name", 256),
                    number(v, "begin"),
@@ -374,9 +442,25 @@ Model load_session(const std::wstring &path) {
         if (s.end < s.begin || s.session != m.session || !v.at("records").is_array() ||
             (total_records += v.at("records").size()) > 250000)
             throw std::runtime_error("Invalid snapshot interval or count");
+        s.id = v.contains("id") ? number(v, "id") : m.next_snapshot;
+        if (!s.id || s.id == UINT64_MAX || !snapshot_ids.insert(s.id).second)
+            throw std::runtime_error("Invalid snapshot identity");
+        m.next_snapshot = std::max(m.next_snapshot, s.id + 1);
+        s.history_truncated =
+            v.contains("history_truncated") ? v.at("history_truncated").get<bool>() : m.history_truncated;
+        s.pinned = v.value("pinned", false);
+        if (s.pinned && ++pinned_count > 1)
+            throw std::runtime_error("Only one snapshot baseline can be pinned");
+        auto mode = v.contains("mode") ? number(v, "mode") : 0;
+        if (mode > 1)
+            throw std::runtime_error("Invalid snapshot mode");
+        s.mode = static_cast<SnapshotMode>(mode);
         std::set<uint64_t> ids;
         for (const auto &a : v.at("records")) {
             auto parsed = parse_allocation(a, budget, m.session);
+            if (s.mode == SnapshotMode::metadata_only &&
+                (!parsed.captures.empty() || !parsed.history.empty() || parsed.life == Life::freed))
+                throw std::runtime_error("Content in metadata-only snapshot");
             if (!ids.insert(parsed.id.generation).second)
                 throw std::runtime_error("Duplicate snapshot identity");
             s.records.push_back(std::move(parsed));
@@ -463,6 +547,16 @@ void export_csv(const Model &m, const std::wstring &path) {
     if (!f.flush())
         throw std::runtime_error("CSV write failed");
 }
+static std::string frame_evidence(const AllocationSite &site,
+                                  const std::map<uint64_t, FrameSymbol> &symbols) {
+    auto evidence = J::array();
+    for (auto address : site_frames(site)) {
+        const auto found = symbols.find(address);
+        evidence.push_back(found == symbols.end() ? J{{"address", address}, {"source", "not resolved"}}
+                                                  : symbol_json(address, found->second));
+    }
+    return evidence.dump();
+}
 static std::string stack_text(const AllocationSite &site) {
     std::string result;
     for (auto frame : site_frames(site)) {
@@ -472,32 +566,36 @@ static std::string stack_text(const AllocationSite &site) {
     }
     return result;
 }
-void export_sites_csv(const AllocationProfile &profile, const std::wstring &path) {
+void export_sites_csv(const AllocationProfile &profile, const std::wstring &path,
+                      const std::map<uint64_t, FrameSymbol> &symbols) {
     std::ofstream file{std::filesystem::path(path)};
     if (!file)
         throw std::runtime_error("Could not open allocation sites CSV");
     file << "session,observed_qpc,incomplete,site_source,frames,live_count,live_requested_bytes,"
             "retained_freed_count,retained_freed_bytes,uncertain_count,uncertain_bytes,unknown_birth_count,"
-            "oldest_known_birth_qpc,bytes_saturated\n";
+            "oldest_known_birth_qpc,bytes_saturated,frame_evidence_json\n";
     for (const auto &row : profile.groups) {
         const auto &t = row.totals;
         file << profile.session << ',' << profile.observed_at << ',' << profile.incomplete << ','
              << csv_text(site_source(row.site)) << ',' << csv_text(stack_text(row.site)) << ','
              << t.live_count << ',' << t.live_bytes << ',' << t.freed_count << ',' << t.freed_bytes << ','
              << t.uncertain_count << ',' << t.uncertain_bytes << ',' << t.unknown_birth_count << ','
-             << t.oldest_known_birth << ',' << t.bytes_saturated << '\n';
+             << t.oldest_known_birth << ',' << t.bytes_saturated << ','
+             << csv_text(frame_evidence(row.site, symbols)) << '\n';
     }
     if (!file.flush())
         throw std::runtime_error("Allocation sites CSV write failed");
 }
-void export_growth_csv(const GrowthReport &report, const std::wstring &path) {
+void export_growth_csv(const GrowthReport &report, const std::wstring &path,
+                       const std::map<uint64_t, FrameSymbol> &symbols) {
     std::ofstream file{std::filesystem::path(path)};
     if (!file)
         throw std::runtime_error("Could not open snapshot growth CSV");
     file << "session,coverage,first_snapshot,last_snapshot,begin_qpc,end_qpc,observations,site_source,frames,"
             "before_live_count,after_live_count,before_live_bytes,after_live_bytes,byte_delta,"
             "before_uncertain_count,after_uncertain_count,survivor_count,survivor_bytes,"
-            "increasing_intervals,sustained_growth,bytes_saturated,uncertain_observations\n";
+            "increasing_intervals,sustained_growth,bytes_saturated,uncertain_observations,frame_evidence_"
+            "json\n";
     for (const auto &row : report.rows)
         file << report.session << ',' << csv_text(growth_coverage_name(report.coverage)) << ','
              << csv_text(report.first_name) << ',' << csv_text(report.last_name) << ',' << report.begin << ','
@@ -507,7 +605,8 @@ void export_growth_csv(const GrowthReport &report, const std::wstring &path) {
              << csv_text(byte_delta(row.before.live_bytes, row.after.live_bytes)) << ','
              << row.before.uncertain_count << ',' << row.after.uncertain_count << ',' << row.survivor_count
              << ',' << row.survivor_bytes << ',' << row.increasing_intervals << ',' << row.sustained_growth
-             << ',' << row.bytes_saturated << ',' << row.uncertain << '\n';
+             << ',' << row.bytes_saturated << ',' << row.uncertain << ','
+             << csv_text(frame_evidence(row.site, symbols)) << '\n';
     if (!file.flush())
         throw std::runtime_error("Snapshot growth CSV write failed");
 }
