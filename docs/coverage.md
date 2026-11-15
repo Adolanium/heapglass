@@ -16,6 +16,8 @@ Optional stack capture uses native RtlCaptureStackBackTrace with fixed local sto
 
 Custom allocators, direct virtual-memory allocation, allocations completed before instrumentation, and allocations during recording gaps are outside heap coverage. Heapglass does not parse undocumented heap layouts, run a remote HeapWalk, or claim a baseline of existing allocations. Unknown frees remain visible as events. A successful reallocation of a pre-existing allocation creates a record with unknown birth.
 
+Launch allows the process loader to run before injection, so startup allocations can precede observation. Only native x64 targets on x64 Windows are supported. Access checks, protected processes, signature policies, different-user sessions, or unavailable fixed TLS slots can prevent instrumentation.
+
 ## Transport and concurrent ordering
 
 Protocol version 2 uses a fixed-size shared mapping, 32,768 preallocated slots, and 160-byte event records. Each 192-byte slot has a sequence counter published with release ordering and read with acquire ordering. The 256-byte header separates producer counters from collector cursor and heartbeat writes by cache line. The mapping occupies about 6 MiB. The mapping header validates its magic, layout, version, PID, process creation time, session identity, and QPC frequency. Addresses in records are integers used only with remote-memory APIs.
@@ -50,6 +52,8 @@ Entropy is empirical Shannon entropy over the captured range. Findings require a
 
 Snapshots retain acquisition intervals and record-level capture times. The interface reports how many records were sampled during acquisition. Other retained captures remain historical. Comparisons show added, freed, resized, modified, unchanged, and uncertain states, with changed offsets for compatible ranges. Missing, unretained, differently sized captured ranges and incomplete histories remain uncertain.
 
+Snapshots do not freeze the target. A snapshot is incomplete if the controller cannot establish an event cutoff within its bounded retry window. That cutoff failure does not invalidate later snapshots. Repeated-growth leads and known survivor counts require complete, compatible observations. See [metadata cutoffs and growth](profiling.md#compare-growth-across-snapshots) and [sustained validation](sustained-validation.md) for the checks and measured resource costs.
+
 ## Memory map and findings
 
 The process map is separate from the heap table and retains committed private, mapped, and image regions even without heap association. VirtualQueryEx memory type, Toolhelp loaded-module association, and GetMappedFileName backing association remain separate facts. The map is polled about once a second. Protection transitions compare matching region ranges, allocation bases, and memory types; mapping reuse between polls remains possible.
@@ -65,6 +69,14 @@ Defaults are 4 KiB per allocation, 1 MiB per scan, 32 MiB of live retained bytes
 Retention caps are 50,000 allocation records, 50,000 heap entries, 10,000 events, eight captures and 64 size-history entries per allocation, and four snapshots with at most 8 MiB of bytes each. These limits bound data, not the exact resident set; queues, parsed JSON, strings, snapshots, and graphics have additional memory cost. Rolling mode evicts the oldest captures across allocations to make space. Stop-at-capacity mode skips new samples at the byte limit. Both modes retain the per-allocation history cap. Lowering a budget trims retained captures immediately. The session panel exposes retained bytes, evictions, skipped samples, exhausted capacity, and queue losses and backlogs.
 
 JSON session format 3 reads formats 1, 2, and 3. Files are limited to 128 MiB and 24 nesting levels. Imports validate counts, enum values, session identities, ranges, offsets, encoding extents, stack bounds, settings, retained-byte hashes, cached symbol evidence, snapshot IDs, modes, and the single pinned baseline. Imports retain at most 64 MiB of raw bytes across live records and snapshots and 10,000 symbol evidence records. Exports use a temporary file and replacement. CSV exports allocation metadata and capture provenance; site and growth CSVs append frame evidence as JSON. The saved session contains the richer history, strings, regions, snapshots, and cached module/build evidence. Findings are recomputed from saved observations and saved thresholds. Legacy incomplete flags remain conservative when their cause is unknown.
+
+## Session compatibility
+
+Version 0.4 uses IPC protocol 2 and session format 3. It reads session formats 1, 2, and 3. Versions 0.2 and 0.3 cannot open newly saved format 3 files. Targets carrying a protocol 1 resident agent require a restart before attachment. Upgrading from protocol 2 does not require a new hook layout.
+
+Saved sessions and report CSVs include available cached DbgHelp symbols, module-relative addresses, PE identity fields, and PDB identity fields with lookup-time provenance. An offline view uses only its own saved evidence. Cached module information is not an event-time module lifetime check. Module unloading or address reuse can limit attribution.
+
+Extracted text remains in session JSON even when raw sampled bytes are excluded. Both can contain sensitive process data.
 
 ## Permissions and lifecycle
 
